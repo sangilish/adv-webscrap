@@ -1,0 +1,9 @@
+{
+	"id": "cCNycX10nZpZNr2",
+	"json": "{\"id\":\"cCNycX10nZpZNr2\",\"url\":\"https://www.curated.media/apps/pmp_library/custom_pmp_library/?tab=Sensitive%20Categories\",\"uniqueKey\":\"https://www.curated.media/apps/pmp_library/custom_pmp_library?tab=Sensitive+Categories\",\"method\":\"GET\",\"noRetry\":false,\"retryCount\":0,\"errorMessages\":[],\"headers\":{},\"userData\":{\"__crawlee\":{\"enqueueStrategy\":\"same-hostname\"}}}",
+	"method": "GET",
+	"orderNo": 1751232227895,
+	"retryCount": 0,
+	"uniqueKey": "https://www.curated.media/apps/pmp_library/custom_pmp_library?tab=Sensitive+Categories",
+	"url": "https://www.curated.media/apps/pmp_library/custom_pmp_library/?tab=Sensitive%20Categories"
+}

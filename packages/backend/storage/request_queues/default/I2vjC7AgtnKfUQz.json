@@ -1,0 +1,9 @@
+{
+	"id": "I2vjC7AgtnKfUQz",
+	"json": "{\"id\":\"I2vjC7AgtnKfUQz\",\"url\":\"https://www.curated.media/apps/closed_loop_optimization/upload_dsp_reporting/\",\"loadedUrl\":\"https://www.curated.media/apps/closed_loop_optimization/upload_dsp_reporting/\",\"uniqueKey\":\"https://www.curated.media/apps/closed_loop_optimization/upload_dsp_reporting\",\"method\":\"GET\",\"noRetry\":false,\"retryCount\":0,\"errorMessages\":[],\"headers\":{},\"userData\":{\"__crawlee\":{\"enqueueStrategy\":\"same-hostname\",\"state\":4}},\"handledAt\":\"2025-06-29T21:20:50.809Z\"}",
+	"method": "GET",
+	"orderNo": null,
+	"retryCount": 0,
+	"uniqueKey": "https://www.curated.media/apps/closed_loop_optimization/upload_dsp_reporting",
+	"url": "https://www.curated.media/apps/closed_loop_optimization/upload_dsp_reporting/"
+}

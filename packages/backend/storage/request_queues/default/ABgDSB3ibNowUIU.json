@@ -1,0 +1,9 @@
+{
+	"id": "ABgDSB3ibNowUIU",
+	"json": "{\"id\":\"ABgDSB3ibNowUIU\",\"url\":\"https://www.curated.media/apps/pmp_library/custom_pmp_library/?tab=Performance\",\"uniqueKey\":\"https://www.curated.media/apps/pmp_library/custom_pmp_library?tab=Performance\",\"method\":\"GET\",\"noRetry\":false,\"retryCount\":0,\"errorMessages\":[],\"headers\":{},\"userData\":{\"__crawlee\":{\"enqueueStrategy\":\"same-hostname\"}}}",
+	"method": "GET",
+	"orderNo": 1751232227895,
+	"retryCount": 0,
+	"uniqueKey": "https://www.curated.media/apps/pmp_library/custom_pmp_library?tab=Performance",
+	"url": "https://www.curated.media/apps/pmp_library/custom_pmp_library/?tab=Performance"
+}

@@ -1,0 +1,9 @@
+{
+	"id": "apANsaF88yhqC2S",
+	"json": "{\"id\":\"apANsaF88yhqC2S\",\"url\":\"https://www.curated.media/apps/help/live-chat/\",\"uniqueKey\":\"https://www.curated.media/apps/help/live-chat\",\"method\":\"GET\",\"noRetry\":false,\"retryCount\":0,\"errorMessages\":[],\"headers\":{},\"userData\":{\"__crawlee\":{\"enqueueStrategy\":\"same-hostname\"}}}",
+	"method": "GET",
+	"orderNo": 1751232227895,
+	"retryCount": 0,
+	"uniqueKey": "https://www.curated.media/apps/help/live-chat",
+	"url": "https://www.curated.media/apps/help/live-chat/"
+}

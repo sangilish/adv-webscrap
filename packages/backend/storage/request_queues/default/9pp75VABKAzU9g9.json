@@ -1,0 +1,9 @@
+{
+	"id": "9pp75VABKAzU9g9",
+	"json": "{\"id\":\"9pp75VABKAzU9g9\",\"url\":\"https://www.curated.media/dashboards\",\"loadedUrl\":\"https://www.curated.media/dashboards/\",\"uniqueKey\":\"https://www.curated.media/dashboards\",\"method\":\"GET\",\"noRetry\":false,\"retryCount\":0,\"errorMessages\":[],\"headers\":{},\"userData\":{\"__crawlee\":{\"state\":4}},\"handledAt\":\"2025-06-29T21:20:42.770Z\"}",
+	"method": "GET",
+	"orderNo": null,
+	"retryCount": 0,
+	"uniqueKey": "https://www.curated.media/dashboards",
+	"url": "https://www.curated.media/dashboards"
+}

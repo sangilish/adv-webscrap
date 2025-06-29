@@ -1,0 +1,9 @@
+{
+	"id": "kcuC5ja5z2pR4U3",
+	"json": "{\"id\":\"kcuC5ja5z2pR4U3\",\"url\":\"https://www.curated.media/apps/help/documentation/\",\"uniqueKey\":\"https://www.curated.media/apps/help/documentation\",\"method\":\"GET\",\"noRetry\":false,\"retryCount\":0,\"errorMessages\":[],\"headers\":{},\"userData\":{\"__crawlee\":{\"enqueueStrategy\":\"same-hostname\"}}}",
+	"method": "GET",
+	"orderNo": 1751232227895,
+	"retryCount": 0,
+	"uniqueKey": "https://www.curated.media/apps/help/documentation",
+	"url": "https://www.curated.media/apps/help/documentation/"
+}

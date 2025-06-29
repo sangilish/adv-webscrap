@@ -1,0 +1,9 @@
+{
+	"id": "pw8MmVXUFwFNCDu",
+	"json": "{\"id\":\"pw8MmVXUFwFNCDu\",\"url\":\"https://www.curated.media/terms-of-service/\",\"uniqueKey\":\"https://www.curated.media/terms-of-service\",\"method\":\"GET\",\"noRetry\":false,\"retryCount\":0,\"errorMessages\":[],\"headers\":{},\"userData\":{\"__crawlee\":{\"enqueueStrategy\":\"same-hostname\"}}}",
+	"method": "GET",
+	"orderNo": 1751232227895,
+	"retryCount": 0,
+	"uniqueKey": "https://www.curated.media/terms-of-service",
+	"url": "https://www.curated.media/terms-of-service/"
+}

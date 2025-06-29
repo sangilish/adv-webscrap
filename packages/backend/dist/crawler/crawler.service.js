@@ -13,7 +13,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.CrawlerService = void 0;
 const common_1 = require("@nestjs/common");
 const prisma_service_1 = require("../prisma/prisma.service");
-const crawlee_1 = require("crawlee");
+const playwright_1 = require("playwright");
 const fs = require("fs");
 const path = require("path");
 let CrawlerService = CrawlerService_1 = class CrawlerService {
@@ -23,6 +23,20 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
         this.prisma = prisma;
     }
     async startCrawling(userId, targetUrl, maxPages = 5) {
+        const user = await this.prisma.user.findUnique({
+            where: { id: userId },
+            include: { analyses: true }
+        });
+        if (!user) {
+            throw new common_1.BadRequestException('User not found');
+        }
+        const currentMonth = new Date();
+        currentMonth.setDate(1);
+        currentMonth.setHours(0, 0, 0, 0);
+        const monthlyAnalyses = user.analyses.filter(analysis => new Date(analysis.createdAt) >= currentMonth);
+        if (user.plan === 'FREE' && monthlyAnalyses.length >= 10) {
+            throw new common_1.BadRequestException('Monthly crawling limit reached. Please upgrade to Pro.');
+        }
         const analysis = await this.prisma.analysis.create({
             data: {
                 userId,
@@ -30,7 +44,7 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
                 status: 'running',
             },
         });
-        this.performCrawling(analysis.id, targetUrl, maxPages).catch((error) => {
+        this.performCrawling(analysis.id, targetUrl, maxPages, user.plan).catch((error) => {
             this.logger.error(`Crawling failed for analysis ${analysis.id}:`, error);
             this.prisma.analysis.update({
                 where: { id: analysis.id },
@@ -39,53 +53,68 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
         });
         return analysis.id;
     }
-    async performCrawling(analysisId, startUrl, maxPages) {
+    async performCrawling(analysisId, startUrl, maxPages, userPlan) {
         const results = [];
         const visitedUrls = new Set();
         const baseUrl = new URL(startUrl).origin;
+        const planLimits = {
+            FREE: 5,
+            PRO: 100,
+            ENTERPRISE: 1000
+        };
+        const actualMaxPages = Math.min(maxPages, planLimits[userPlan] || 5);
         const outputDir = path.join(process.cwd(), 'uploads', analysisId);
         const screenshotsDir = path.join(outputDir, 'screenshots');
         const htmlDir = path.join(outputDir, 'html');
         await fs.promises.mkdir(screenshotsDir, { recursive: true });
         await fs.promises.mkdir(htmlDir, { recursive: true });
-        const crawler = new crawlee_1.PlaywrightCrawler({
-            maxRequestsPerCrawl: maxPages,
-            requestHandler: async ({ page, request, enqueueLinks }) => {
-                const url = request.loadedUrl || request.url;
-                if (visitedUrls.has(url) || visitedUrls.size >= maxPages) {
-                    return;
+        const browser = await playwright_1.chromium.launch({ headless: true });
+        const context = await browser.newContext({
+            userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+        });
+        try {
+            const urlsToVisit = [startUrl];
+            while (urlsToVisit.length > 0 && results.length < actualMaxPages) {
+                const currentUrl = urlsToVisit.shift();
+                if (!currentUrl || visitedUrls.has(currentUrl)) {
+                    continue;
                 }
-                visitedUrls.add(url);
-                this.logger.log(`Crawling: ${url}`);
+                visitedUrls.add(currentUrl);
+                this.logger.log(`Crawling: ${currentUrl} (${results.length + 1}/${actualMaxPages})`);
+                const page = await context.newPage();
                 try {
-                    await page.waitForLoadState('networkidle', { timeout: 10000 });
+                    await page.goto(currentUrl, { waitUntil: 'networkidle', timeout: 15000 });
                     await this.removeCookiePopups(page);
-                    const result = await this.extractPageData(page, url, analysisId, screenshotsDir, htmlDir);
+                    const result = await this.extractPageData(page, currentUrl, analysisId, screenshotsDir, htmlDir);
                     results.push(result);
-                    if (visitedUrls.size < maxPages) {
-                        await enqueueLinks({
-                            selector: 'a[href]',
-                            baseUrl: url,
-                            transformRequestFunction: (req) => {
-                                const reqUrl = new URL(req.url);
-                                if (reqUrl.origin === baseUrl && !visitedUrls.has(req.url)) {
-                                    return req;
+                    await this.prisma.analysis.update({
+                        where: { id: analysisId },
+                        data: {
+                            pageCount: results.length,
+                            progress: Math.round((results.length / actualMaxPages) * 100)
+                        },
+                    });
+                    if (results.length < actualMaxPages) {
+                        const links = await page.$$eval('a[href]', (anchors) => anchors.map(a => a.href).filter(href => href && href.startsWith('http')));
+                        for (const link of links) {
+                            try {
+                                const linkUrl = new URL(link);
+                                if (linkUrl.origin === baseUrl && !visitedUrls.has(link) && !urlsToVisit.includes(link)) {
+                                    urlsToVisit.push(link);
                                 }
-                                return false;
-                            },
-                        });
+                            }
+                            catch (e) {
+                            }
+                        }
                     }
                 }
                 catch (error) {
-                    this.logger.error(`Error crawling ${url}:`, error);
+                    this.logger.error(`Error crawling ${currentUrl}:`, error);
                 }
-            },
-            failedRequestHandler: async ({ request }) => {
-                this.logger.error(`Failed to crawl: ${request.url}`);
-            },
-        });
-        try {
-            await crawler.run([startUrl]);
+                finally {
+                    await page.close();
+                }
+            }
             const networkData = this.generateNetworkData(results);
             const visualizationHtml = this.generateVisualizationHtml(networkData, results);
             const htmlPath = path.join(outputDir, 'visualization.html');
@@ -95,21 +124,21 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
                 data: {
                     status: 'completed',
                     pageCount: results.length,
-                    resultData: JSON.stringify({
-                        results,
-                        networkData,
-                    }),
-                    title: results[0]?.title || 'Unknown',
+                    progress: 100,
+                    completedAt: new Date(),
                 },
             });
-            this.logger.log(`Crawling completed for analysis ${analysisId}`);
+            this.logger.log(`Crawling completed for analysis ${analysisId}. ${results.length} pages crawled.`);
         }
         catch (error) {
-            this.logger.error(`Crawling failed:`, error);
+            this.logger.error(`Crawling failed for analysis ${analysisId}:`, error);
             await this.prisma.analysis.update({
                 where: { id: analysisId },
                 data: { status: 'failed' },
             });
+        }
+        finally {
+            await browser.close();
         }
     }
     async removeCookiePopups(page) {
@@ -120,12 +149,38 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
             '[id*="consent"]',
             '[class*="gdpr"]',
             '[id*="gdpr"]',
+            '[class*="banner"]',
+            '[class*="popup"]',
+            '[class*="modal"]'
         ];
         for (const selector of cookieSelectors) {
             try {
                 const elements = await page.$$(selector);
                 for (const element of elements) {
-                    await element.evaluate((el) => el.remove());
+                    const isVisible = await element.isVisible();
+                    if (isVisible) {
+                        await element.evaluate((el) => el.remove());
+                    }
+                }
+            }
+            catch (error) {
+            }
+        }
+        const acceptSelectors = [
+            'button:has-text("Accept")',
+            'button:has-text("Accept All")',
+            'button:has-text("OK")',
+            'button:has-text("Got it")',
+            '[class*="accept"]',
+            '[id*="accept"]'
+        ];
+        for (const selector of acceptSelectors) {
+            try {
+                const button = await page.$(selector);
+                if (button && await button.isVisible()) {
+                    await button.click();
+                    await page.waitForTimeout(1000);
+                    break;
                 }
             }
             catch (error) {
@@ -135,16 +190,17 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
     async extractPageData(page, url, analysisId, screenshotsDir, htmlDir) {
         const timestamp = new Date().toISOString();
         const urlHash = Buffer.from(url).toString('base64').replace(/[/+=]/g, '-');
-        const screenshotFileName = `${urlHash}-${timestamp.replace(/[:.]/g, '-')}.png`;
-        const screenshotPath = path.join(screenshotsDir, screenshotFileName);
+        const pageId = `page_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        const screenshotFilename = `${pageId}.png`;
+        const screenshotPath = path.join(screenshotsDir, screenshotFilename);
         await page.screenshot({
             path: screenshotPath,
             fullPage: true,
             type: 'png'
         });
-        const htmlFileName = `${urlHash}-${timestamp.replace(/[:.]/g, '-')}.html`;
-        const htmlPath = path.join(htmlDir, htmlFileName);
         const htmlContent = await page.content();
+        const htmlFilename = `${pageId}.html`;
+        const htmlPath = path.join(htmlDir, htmlFilename);
         await fs.promises.writeFile(htmlPath, htmlContent);
         const pageData = await page.evaluate(() => {
             const title = document.title || '';
@@ -152,10 +208,11 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
                 .map(a => a.href)
                 .filter(href => href && !href.startsWith('javascript:') && !href.startsWith('mailto:'));
             const images = Array.from(document.querySelectorAll('img[src]'))
-                .map(img => img.src);
+                .map(img => img.src)
+                .filter(src => src);
             const headings = Array.from(document.querySelectorAll('h1, h2, h3, h4, h5, h6'))
                 .map(h => ({
-                level: h.tagName,
+                level: h.tagName.toLowerCase(),
                 text: h.textContent?.trim() || ''
             }))
                 .filter(h => h.text);
@@ -167,11 +224,19 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
                 images,
                 headings,
                 forms,
-                textContent: textContent.substring(0, 1000)
+                textContent
             };
         });
         const pageType = this.classifyPageType(url, pageData.title, pageData.headings);
-        return {
+        const isPreview = analysisId.startsWith('preview_');
+        const screenshotUrl = isPreview
+            ? `/temp/${analysisId}/screenshots/${screenshotFilename}`
+            : `/uploads/${analysisId}/screenshots/${screenshotFilename}`;
+        const htmlUrl = isPreview
+            ? `/temp/${analysisId}/html/${htmlFilename}`
+            : `/uploads/${analysisId}/html/${htmlFilename}`;
+        const result = {
+            id: pageId,
             url,
             title: pageData.title,
             pageType,
@@ -180,48 +245,55 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
             headings: pageData.headings,
             forms: pageData.forms,
             textContent: pageData.textContent,
-            screenshotPath: path.relative(process.cwd(), screenshotPath),
-            htmlPath: path.relative(process.cwd(), htmlPath),
+            screenshotPath: screenshotUrl,
+            htmlPath: htmlUrl,
             timestamp,
+            metadata: {
+                wordCount: pageData.textContent.split(/\s+/).length,
+                imageCount: pageData.images.length,
+                linkCount: pageData.links.length
+            }
         };
+        return result;
     }
     classifyPageType(url, title, headings) {
         const urlLower = url.toLowerCase();
         const titleLower = title.toLowerCase();
-        const headingText = headings.map(h => h.text.toLowerCase()).join(' ');
-        const allText = `${urlLower} ${titleLower} ${headingText}`;
-        if (urlLower.includes('/') && urlLower.split('/').length <= 4)
-            return 'homepage';
-        if (allText.includes('about') || allText.includes('소개'))
-            return 'about';
-        if (allText.includes('contact') || allText.includes('연락') || allText.includes('문의'))
-            return 'contact';
-        if (allText.includes('product') || allText.includes('제품'))
-            return 'product';
-        if (allText.includes('service') || allText.includes('서비스'))
-            return 'service';
-        if (allText.includes('blog') || allText.includes('블로그') || allText.includes('news'))
+        if (urlLower.includes('/blog') || urlLower.includes('/news') || titleLower.includes('blog')) {
             return 'blog';
-        return 'other';
+        }
+        else if (urlLower.includes('/product') || urlLower.includes('/shop') || titleLower.includes('product')) {
+            return 'product';
+        }
+        else if (urlLower.includes('/about') || titleLower.includes('about')) {
+            return 'about';
+        }
+        else if (urlLower.includes('/contact') || titleLower.includes('contact')) {
+            return 'contact';
+        }
+        else if (url === new URL(url).origin || urlLower.endsWith('/') && urlLower.split('/').length <= 4) {
+            return 'homepage';
+        }
+        return 'page';
     }
     generateNetworkData(results) {
         const nodes = results.map(result => ({
-            id: result.url,
-            label: result.title || new URL(result.url).pathname,
+            id: result.id,
+            label: result.title || 'Untitled',
             color: this.getColorByPageType(result.pageType),
             type: result.pageType,
             url: result.url,
             title: result.title,
-            screenshot: result.screenshotPath,
+            screenshot: result.screenshotPath
         }));
         const edges = [];
-        const urlSet = new Set(results.map(r => r.url));
-        results.forEach(result => {
-            result.links.forEach(link => {
-                if (urlSet.has(link) && link !== result.url) {
+        results.forEach(fromResult => {
+            fromResult.links.forEach(link => {
+                const toResult = results.find(r => r.url === link);
+                if (toResult && fromResult.id !== toResult.id) {
                     edges.push({
-                        from: result.url,
-                        to: link,
+                        from: fromResult.id,
+                        to: toResult.id
                     });
                 }
             });
@@ -234,170 +306,238 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
             about: '#4ECDC4',
             contact: '#45B7D1',
             product: '#96CEB4',
-            service: '#FFEAA7',
-            blog: '#DDA0DD',
-            other: '#74B9FF',
+            blog: '#FFEAA7',
+            page: '#DDA0DD'
         };
-        return colors[pageType] || colors.other;
+        return colors[pageType] || colors.page;
+    }
+    async getUserAnalyses(userId, limit) {
+        const user = await this.prisma.user.findUnique({
+            where: { id: userId }
+        });
+        const actualLimit = user?.plan === 'FREE' ? 5 : (limit || 50);
+        return this.prisma.analysis.findMany({
+            where: { userId },
+            orderBy: { createdAt: 'desc' },
+            take: actualLimit,
+            select: {
+                id: true,
+                url: true,
+                title: true,
+                status: true,
+                pageCount: true,
+                progress: true,
+                createdAt: true,
+                updatedAt: true
+            }
+        });
+    }
+    async getAnalysis(analysisId, userId) {
+        const analysis = await this.prisma.analysis.findFirst({
+            where: {
+                id: analysisId,
+                userId
+            }
+        });
+        if (!analysis) {
+            throw new common_1.BadRequestException('Analysis not found');
+        }
+        return {
+            ...analysis,
+            resultData: analysis.resultData ? JSON.parse(analysis.resultData) : null
+        };
+    }
+    async getPreviewAnalysis(url) {
+        this.logger.log(`Starting preview analysis for: ${url}`);
+        const tempId = `preview_${Date.now()}`;
+        const results = [];
+        const visitedUrls = new Set();
+        const tempDir = path.join(process.cwd(), 'temp', tempId);
+        const screenshotsDir = path.join(tempDir, 'screenshots');
+        const htmlDir = path.join(tempDir, 'html');
+        await fs.promises.mkdir(screenshotsDir, { recursive: true });
+        await fs.promises.mkdir(htmlDir, { recursive: true });
+        const browser = await playwright_1.chromium.launch({ headless: true });
+        const context = await browser.newContext({
+            userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+        });
+        try {
+            const baseUrl = new URL(url).origin;
+            const urlsToVisit = [url];
+            const maxPages = 5;
+            while (urlsToVisit.length > 0 && results.length < maxPages) {
+                const currentUrl = urlsToVisit.shift();
+                if (!currentUrl || visitedUrls.has(currentUrl)) {
+                    continue;
+                }
+                visitedUrls.add(currentUrl);
+                this.logger.log(`Preview crawling: ${currentUrl} (${results.length + 1}/${maxPages})`);
+                const page = await context.newPage();
+                try {
+                    await page.goto(currentUrl, { waitUntil: 'networkidle', timeout: 15000 });
+                    await this.removeCookiePopups(page);
+                    const result = await this.extractPageData(page, currentUrl, tempId, screenshotsDir, htmlDir);
+                    results.push(result);
+                    if (results.length < maxPages) {
+                        const links = await page.$$eval('a[href]', (anchors) => anchors.map(a => a.href).filter(href => href && href.startsWith('http')));
+                        for (const link of links.slice(0, 10)) {
+                            try {
+                                const linkUrl = new URL(link);
+                                if (linkUrl.origin === baseUrl && !visitedUrls.has(link) && !urlsToVisit.includes(link)) {
+                                    urlsToVisit.push(link);
+                                }
+                            }
+                            catch (e) {
+                            }
+                        }
+                    }
+                }
+                catch (error) {
+                    this.logger.error(`Error crawling ${currentUrl}:`, error);
+                }
+                finally {
+                    await page.close();
+                }
+            }
+            const networkData = this.generateNetworkData(results);
+            this.logger.log(`Preview analysis completed for: ${url}, results: ${results.length}`);
+            return {
+                results,
+                networkData,
+                totalPages: results.length,
+                isPreview: true,
+                previewLimit: 5
+            };
+        }
+        catch (error) {
+            this.logger.error(`Preview analysis failed for ${url}:`, error);
+            const mockResults = [
+                {
+                    id: `page_${Date.now()}_mock`,
+                    url,
+                    title: 'Sample Page Title',
+                    pageType: 'homepage',
+                    links: [],
+                    images: [],
+                    headings: [{ level: 'h1', text: 'Main Heading' }],
+                    forms: 0,
+                    textContent: 'Sample content from the crawled page.',
+                    screenshotPath: `/temp/${tempId}/screenshots/mock.png`,
+                    htmlPath: `/temp/${tempId}/html/mock.html`,
+                    timestamp: new Date().toISOString(),
+                    metadata: {
+                        wordCount: 8,
+                        imageCount: 0,
+                        linkCount: 0
+                    }
+                }
+            ];
+            const networkData = this.generateNetworkData(mockResults);
+            return {
+                results: mockResults,
+                networkData,
+                totalPages: mockResults.length,
+                isPreview: true,
+                previewLimit: 5,
+                error: 'Crawling failed, showing sample data'
+            };
+        }
+        finally {
+            await browser.close();
+        }
+    }
+    async crawlSinglePage(page, url, tempId, screenshotsDir, htmlDir, results, visitedUrls) {
+        if (visitedUrls.has(url))
+            return;
+        visitedUrls.add(url);
+        this.logger.log(`Crawling: ${url} (${visitedUrls.size})`);
+        try {
+            await page.goto(url, { waitUntil: 'networkidle', timeout: 15000 });
+            await this.removeCookiePopups(page);
+            const result = await this.extractPageData(page, url, tempId, screenshotsDir, htmlDir);
+            results.push(result);
+        }
+        catch (error) {
+            this.logger.error(`Error crawling ${url}:`, error);
+        }
+    }
+    async downloadFile(analysisId, userId, fileType, pageId) {
+        const analysis = await this.prisma.analysis.findFirst({
+            where: {
+                id: analysisId,
+                userId,
+                status: 'completed'
+            }
+        });
+        if (!analysis) {
+            throw new common_1.BadRequestException('Analysis not found or not completed');
+        }
+        const resultData = analysis.resultData ? JSON.parse(analysis.resultData) : null;
+        if (!resultData?.results) {
+            throw new common_1.BadRequestException('No results found');
+        }
+        const page = resultData.results.find(r => r.id === pageId);
+        if (!page) {
+            throw new common_1.BadRequestException('Page not found');
+        }
+        const filePath = fileType === 'png' ? page.screenshotPath : page.htmlPath;
+        const fullPath = path.join(process.cwd(), filePath.replace('/uploads/', 'uploads/'));
+        if (!fs.existsSync(fullPath)) {
+            throw new common_1.BadRequestException('File not found');
+        }
+        return {
+            filePath: fullPath,
+            filename: path.basename(fullPath),
+            contentType: fileType === 'png' ? 'image/png' : 'text/html'
+        };
     }
     generateVisualizationHtml(networkData, results) {
         return `
 <!DOCTYPE html>
-<html lang="ko">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SiteMapper AI - 웹사이트 구조 분석</title>
+    <title>Website Structure Visualization</title>
     <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #1a1a1a; color: #fff; }
-        .container { display: flex; height: 100vh; }
-        .map-container { flex: 1; position: relative; background: #2a2a2a; }
-        #mynetworkid { width: 100%; height: 100%; }
-        .sidebar { width: 400px; background: #333; padding: 20px; overflow-y: auto; }
-        .controls { position: absolute; top: 20px; left: 20px; z-index: 1000; }
-        .control-btn { 
-            background: #4CAF50; color: white; border: none; padding: 10px 15px; 
-            margin: 5px; border-radius: 5px; cursor: pointer; 
-        }
-        .control-btn:hover { background: #45a049; }
-        .legend { position: absolute; top: 20px; right: 20px; background: rgba(0,0,0,0.8); padding: 15px; border-radius: 10px; }
-        .legend-item { display: flex; align-items: center; margin: 5px 0; }
-        .legend-color { width: 20px; height: 20px; border-radius: 50%; margin-right: 10px; }
-        .page-info { background: #444; padding: 15px; border-radius: 10px; margin-bottom: 20px; }
-        .screenshot { max-width: 100%; border-radius: 5px; margin: 10px 0; }
-        .stats { background: #555; padding: 10px; border-radius: 5px; margin: 10px 0; font-size: 0.9em; }
+        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; }
+        #network { height: 600px; border: 1px solid #ccc; }
+        .info-panel { margin-top: 20px; padding: 15px; background: #f5f5f5; border-radius: 8px; }
+        .page-info { margin: 10px 0; padding: 10px; background: white; border-radius: 4px; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="map-container">
-            <div id="mynetworkid"></div>
-            <div class="controls">
-                <button class="control-btn" onclick="network.fit()">전체 보기</button>
-                <button class="control-btn" onclick="resetZoom()">줌 리셋</button>
-                <button class="control-btn" onclick="exportImage()">이미지 저장</button>
-            </div>
-            <div class="legend">
-                <h4>📋 페이지 타입</h4>
-                <div class="legend-item"><div class="legend-color" style="background: #FF6B6B;"></div><span>홈페이지</span></div>
-                <div class="legend-item"><div class="legend-color" style="background: #4ECDC4;"></div><span>소개</span></div>
-                <div class="legend-item"><div class="legend-color" style="background: #45B7D1;"></div><span>연락처</span></div>
-                <div class="legend-item"><div class="legend-color" style="background: #96CEB4;"></div><span>제품</span></div>
-                <div class="legend-item"><div class="legend-color" style="background: #FFEAA7;"></div><span>서비스</span></div>
-                <div class="legend-item"><div class="legend-color" style="background: #DDA0DD;"></div><span>블로그</span></div>
-                <div class="legend-item"><div class="legend-color" style="background: #74B9FF;"></div><span>기타</span></div>
-            </div>
-        </div>
-        <div class="sidebar">
-            <h3>📄 페이지 정보</h3>
-            <div id="page-details">
-                <div class="page-info">
-                    <p>노드를 클릭하여 페이지 정보를 확인하세요.</p>
-                </div>
-            </div>
-        </div>
+    <h1>Website Structure Analysis</h1>
+    <div id="network"></div>
+    <div class="info-panel">
+        <h3>Analysis Summary</h3>
+        <p><strong>Total Pages:</strong> ${results.length}</p>
+        <p><strong>Total Links:</strong> ${results.reduce((sum, r) => sum + r.links.length, 0)}</p>
+        <p><strong>Total Images:</strong> ${results.reduce((sum, r) => sum + r.images.length, 0)}</p>
     </div>
-
+    
     <script>
-        const networkData = ${JSON.stringify(networkData)};
-        const resultsData = ${JSON.stringify(results)};
-        
-        const nodes = new vis.DataSet(networkData.nodes.map(node => ({
-            ...node,
-            shape: 'dot',
-            size: 30,
-            font: { color: '#ffffff', size: 14 },
-            borderWidth: 2,
-            borderColor: '#ffffff'
-        })));
-        
-        const edges = new vis.DataSet(networkData.edges.map(edge => ({
-            ...edge,
-            color: { color: '#666666', highlight: '#ffffff' },
-            width: 2,
-            arrows: { to: { enabled: true, scaleFactor: 0.5 } }
-        })));
-        
-        const container = document.getElementById('mynetworkid');
-        const data = { nodes, edges };
+        const nodes = new vis.DataSet(${JSON.stringify(networkData.nodes)});
+        const edges = new vis.DataSet(${JSON.stringify(networkData.edges)});
+        const container = document.getElementById('network');
+        const data = { nodes: nodes, edges: edges };
         const options = {
-            physics: {
-                stabilization: { iterations: 100 },
-                barnesHut: { gravitationalConstant: -2000, springLength: 200 }
+            nodes: {
+                shape: 'dot',
+                size: 20,
+                font: { size: 12 }
             },
-            interaction: { hover: true, selectConnectedEdges: false },
-            layout: { randomSeed: 42 }
-        };
-        
-        const network = new vis.Network(container, data, options);
-        
-        network.on('click', function(params) {
-            if (params.nodes.length > 0) {
-                const nodeId = params.nodes[0];
-                const result = resultsData.find(r => r.url === nodeId);
-                if (result) {
-                    showPageDetails(result);
-                }
+            edges: {
+                arrows: 'to'
+            },
+            physics: {
+                enabled: true,
+                stabilization: { iterations: 100 }
             }
-        });
-        
-        function showPageDetails(result) {
-            const detailsDiv = document.getElementById('page-details');
-            detailsDiv.innerHTML = \`
-                <div class="page-info">
-                    <h4>\${result.title}</h4>
-                    <p><strong>URL:</strong> \${result.url}</p>
-                    <p><strong>타입:</strong> \${result.pageType}</p>
-                    <div class="stats">
-                        📝 제목: \${result.headings.length}개 | 
-                        🔗 링크: \${result.links.length}개 | 
-                        🖼️ 이미지: \${result.images.length}개 | 
-                        📋 폼: \${result.forms}개
-                    </div>
-                    <img src="\${result.screenshotPath}" class="screenshot" alt="스크린샷">
-                    <h5>📝 제목들</h5>
-                    <ul style="max-height: 120px; overflow-y: auto;">
-                        \${result.headings.map(h => \`<li>[\${h.level}] \${h.text}</li>\`).join('')}
-                    </ul>
-                </div>
-            \`;
-        }
-        
-        function resetZoom() {
-            network.moveTo({ scale: 1 });
-        }
-        
-        function exportImage() {
-            const canvas = container.querySelector('canvas');
-            const link = document.createElement('a');
-            link.download = 'website-map.png';
-            link.href = canvas.toDataURL();
-            link.click();
-        }
+        };
+        const network = new vis.Network(container, data, options);
     </script>
 </body>
-</html>
-    `;
-    }
-    async getAnalysis(analysisId, userId) {
-        return this.prisma.analysis.findFirst({
-            where: {
-                id: analysisId,
-                userId,
-            },
-            include: {
-                downloads: true,
-            },
-        });
-    }
-    async getUserAnalyses(userId) {
-        return this.prisma.analysis.findMany({
-            where: { userId },
-            orderBy: { createdAt: 'desc' },
-            take: 20,
-        });
+</html>`;
     }
 };
 exports.CrawlerService = CrawlerService;

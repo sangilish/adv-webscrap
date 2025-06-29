@@ -1,0 +1,9 @@
+{
+	"id": "0XU48iJplQeszcV",
+	"json": "{\"id\":\"0XU48iJplQeszcV\",\"url\":\"https://www.curated.media/apps/added_value/analytics/\",\"uniqueKey\":\"https://www.curated.media/apps/added_value/analytics\",\"method\":\"GET\",\"noRetry\":false,\"retryCount\":0,\"errorMessages\":[],\"headers\":{},\"userData\":{\"__crawlee\":{\"enqueueStrategy\":\"same-hostname\"}}}",
+	"method": "GET",
+	"orderNo": 1751232227895,
+	"retryCount": 0,
+	"uniqueKey": "https://www.curated.media/apps/added_value/analytics",
+	"url": "https://www.curated.media/apps/added_value/analytics/"
+}

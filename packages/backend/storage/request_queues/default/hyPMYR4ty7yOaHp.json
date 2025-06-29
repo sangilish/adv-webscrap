@@ -1,0 +1,9 @@
+{
+	"id": "hyPMYR4ty7yOaHp",
+	"json": "{\"id\":\"hyPMYR4ty7yOaHp\",\"url\":\"https://www.curated.media/apps/pmp_library/contextual/\",\"uniqueKey\":\"https://www.curated.media/apps/pmp_library/contextual\",\"method\":\"GET\",\"noRetry\":false,\"retryCount\":0,\"errorMessages\":[],\"headers\":{},\"userData\":{\"__crawlee\":{\"enqueueStrategy\":\"same-hostname\"}}}",
+	"method": "GET",
+	"orderNo": 1751232227895,
+	"retryCount": 0,
+	"uniqueKey": "https://www.curated.media/apps/pmp_library/contextual",
+	"url": "https://www.curated.media/apps/pmp_library/contextual/"
+}

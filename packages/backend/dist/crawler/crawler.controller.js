@@ -17,7 +17,6 @@ const common_1 = require("@nestjs/common");
 const jwt_auth_guard_1 = require("../auth/jwt-auth.guard");
 const crawler_service_1 = require("./crawler.service");
 const prisma_service_1 = require("../prisma/prisma.service");
-const path = require("path");
 const fs = require("fs");
 let CrawlerController = class CrawlerController {
     crawlerService;
@@ -26,284 +25,166 @@ let CrawlerController = class CrawlerController {
         this.crawlerService = crawlerService;
         this.prisma = prisma;
     }
-    async startAnalysis(body, req) {
-        const { url, maxPages = 5 } = body;
-        const userId = req.user.userId;
+    async getPreview(url, response) {
+        console.log('Preview endpoint called with URL:', url);
+        response.header('Access-Control-Allow-Origin', 'http://localhost:3000');
+        response.header('Access-Control-Allow-Credentials', 'true');
+        response.header('Access-Control-Allow-Methods', 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS');
+        response.header('Access-Control-Allow-Headers', 'Content-Type, Accept, Authorization');
+        if (!url) {
+            throw new common_1.BadRequestException('URL is required');
+        }
         try {
             new URL(url);
         }
-        catch {
-            throw new common_1.BadRequestException('유효하지 않은 URL입니다.');
+        catch (error) {
+            throw new common_1.BadRequestException('Invalid URL format');
         }
-        const user = await this.prisma.user.findUnique({
-            where: { id: userId },
-        });
-        if (!user) {
-            throw new common_1.NotFoundException('사용자를 찾을 수 없습니다.');
+        console.log('Calling crawlerService.getPreviewAnalysis...');
+        const result = await this.crawlerService.getPreviewAnalysis(url);
+        console.log('Service returned:', result);
+        return result;
+    }
+    async startCrawling(req, body) {
+        const { url, maxPages = 5 } = body;
+        if (!url) {
+            throw new common_1.BadRequestException('URL is required');
         }
-        if (maxPages > 5 && user.subscriptionType === 'free') {
-            throw new common_1.ForbiddenException('무료 사용자는 최대 5페이지까지만 분석할 수 있습니다. 더 많은 페이지를 분석하려면 결제가 필요합니다.');
+        try {
+            new URL(url);
         }
-        if (user.freeAnalysisCount >= 5 && user.subscriptionType === 'free') {
-            throw new common_1.ForbiddenException('무료 분석 횟수를 모두 사용했습니다. 추가 분석을 위해서는 결제가 필요합니다.');
+        catch (error) {
+            throw new common_1.BadRequestException('Invalid URL format');
         }
-        const analysisId = await this.crawlerService.startCrawling(userId, url, maxPages);
-        if (user.subscriptionType === 'free') {
-            await this.prisma.user.update({
-                where: { id: userId },
-                data: { freeAnalysisCount: user.freeAnalysisCount + 1 },
-            });
-        }
+        const analysisId = await this.crawlerService.startCrawling(req.user.userId, url, maxPages);
         return {
             analysisId,
-            message: '분석이 시작되었습니다. 잠시 후 결과를 확인해주세요.',
-            estimatedTime: `약 ${maxPages * 2}초`,
+            message: 'Crawling started successfully',
+            status: 'running'
         };
     }
-    async getAnalysis(analysisId, req) {
-        const userId = req.user.userId;
-        const analysis = await this.crawlerService.getAnalysis(analysisId, userId);
-        if (!analysis) {
-            throw new common_1.NotFoundException('분석 결과를 찾을 수 없습니다.');
-        }
-        return analysis;
-    }
-    async getVisualization(analysisId, req, res) {
-        const userId = req.user.userId;
-        const analysis = await this.crawlerService.getAnalysis(analysisId, userId);
-        if (!analysis) {
-            throw new common_1.NotFoundException('분석 결과를 찾을 수 없습니다.');
-        }
-        if (analysis.status !== 'completed') {
-            throw new common_1.BadRequestException('분석이 아직 완료되지 않았습니다.');
-        }
-        const visualizationPath = path.join(process.cwd(), 'uploads', analysisId, 'visualization.html');
-        if (!fs.existsSync(visualizationPath)) {
-            throw new common_1.NotFoundException('시각화 파일을 찾을 수 없습니다.');
-        }
-        res.sendFile(visualizationPath);
-    }
-    async getScreenshot(analysisId, filename, req, res) {
-        const userId = req.user.userId;
-        const analysis = await this.crawlerService.getAnalysis(analysisId, userId);
-        if (!analysis) {
-            throw new common_1.NotFoundException('분석 결과를 찾을 수 없습니다.');
-        }
-        const screenshotPath = path.join(process.cwd(), 'uploads', analysisId, 'screenshots', filename);
-        if (!fs.existsSync(screenshotPath)) {
-            throw new common_1.NotFoundException('스크린샷을 찾을 수 없습니다.');
-        }
-        res.sendFile(screenshotPath);
-    }
-    async downloadFile(analysisId, body, req) {
-        const { fileType } = body;
-        const userId = req.user.userId;
-        const analysis = await this.crawlerService.getAnalysis(analysisId, userId);
-        if (!analysis) {
-            throw new common_1.NotFoundException('분석 결과를 찾을 수 없습니다.');
-        }
-        const user = await this.prisma.user.findUnique({
-            where: { id: userId },
-        });
-        if (!user) {
-            throw new common_1.NotFoundException('사용자를 찾을 수 없습니다.');
-        }
-        if (fileType === 'html' && user.subscriptionType !== 'pro') {
-            throw new common_1.ForbiddenException('HTML 소스 다운로드는 프로 구독자만 이용할 수 있습니다.');
-        }
-        let filePath;
-        let fileName;
-        switch (fileType) {
-            case 'png':
-                filePath = path.join(process.cwd(), 'uploads', analysisId, 'visualization.html');
-                fileName = `${analysis.title || 'analysis'}-map.png`;
-                break;
-            case 'html':
-                filePath = path.join(process.cwd(), 'uploads', analysisId, 'visualization.html');
-                fileName = `${analysis.title || 'analysis'}-visualization.html`;
-                break;
-            case 'json':
-                filePath = path.join(process.cwd(), 'uploads', analysisId, 'data.json');
-                fileName = `${analysis.title || 'analysis'}-data.json`;
-                if (!fs.existsSync(filePath)) {
-                    await fs.promises.writeFile(filePath, analysis.resultData || '{}');
-                }
-                break;
-        }
-        if (!fs.existsSync(filePath)) {
-            throw new common_1.NotFoundException('다운로드할 파일을 찾을 수 없습니다.');
-        }
-        await this.prisma.download.create({
-            data: {
-                userId,
-                analysisId,
-                fileType,
-                filePath: path.relative(process.cwd(), filePath),
-            },
-        });
-        return {
-            downloadUrl: `/crawler/analysis/${analysisId}/file/${fileType}`,
-            fileName,
-            message: '다운로드 준비가 완료되었습니다.',
-        };
-    }
-    async downloadFileStream(analysisId, fileType, req, res) {
-        const userId = req.user.userId;
-        const analysis = await this.crawlerService.getAnalysis(analysisId, userId);
-        if (!analysis) {
-            throw new common_1.NotFoundException('분석 결과를 찾을 수 없습니다.');
-        }
-        let filePath;
-        let fileName;
-        let contentType;
-        switch (fileType) {
-            case 'png':
-                filePath = path.join(process.cwd(), 'uploads', analysisId, 'visualization.html');
-                fileName = `${analysis.title || 'analysis'}-map.html`;
-                contentType = 'text/html';
-                break;
-            case 'html':
-                filePath = path.join(process.cwd(), 'uploads', analysisId, 'visualization.html');
-                fileName = `${analysis.title || 'analysis'}-visualization.html`;
-                contentType = 'text/html';
-                break;
-            case 'json':
-                filePath = path.join(process.cwd(), 'uploads', analysisId, 'data.json');
-                fileName = `${analysis.title || 'analysis'}-data.json`;
-                contentType = 'application/json';
-                if (!fs.existsSync(filePath)) {
-                    await fs.promises.writeFile(filePath, analysis.resultData || '{}');
-                }
-                break;
-            default:
-                throw new common_1.BadRequestException('지원하지 않는 파일 형식입니다.');
-        }
-        if (!fs.existsSync(filePath)) {
-            throw new common_1.NotFoundException('다운로드할 파일을 찾을 수 없습니다.');
-        }
-        res.setHeader('Content-Type', contentType);
-        res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
-        res.sendFile(filePath);
-    }
-    async getAnalysisHistory(req) {
-        const userId = req.user.userId;
-        const analyses = await this.crawlerService.getUserAnalyses(userId);
-        return {
-            analyses: analyses.map(analysis => ({
-                id: analysis.id,
-                url: analysis.url,
-                title: analysis.title,
-                status: analysis.status,
-                pageCount: analysis.pageCount,
-                createdAt: analysis.createdAt,
-                updatedAt: analysis.updatedAt,
-            })),
-            total: analyses.length,
-        };
-    }
-    async getAnalysisStatus(analysisId, req) {
-        const userId = req.user.userId;
-        const analysis = await this.crawlerService.getAnalysis(analysisId, userId);
-        if (!analysis) {
-            throw new common_1.NotFoundException('분석 결과를 찾을 수 없습니다.');
-        }
+    async getAnalysisStatus(req, analysisId) {
+        const analysis = await this.crawlerService.getAnalysis(analysisId, req.user.userId);
         return {
             id: analysis.id,
             status: analysis.status,
-            pageCount: analysis.pageCount,
-            progress: analysis.status === 'completed' ? 100 :
-                analysis.status === 'running' ? 50 : 0,
-            message: this.getStatusMessage(analysis.status),
+            progress: analysis.progress || 0,
+            pageCount: analysis.pageCount || 0,
+            url: analysis.url,
+            title: analysis.title
         };
     }
-    getStatusMessage(status) {
-        switch (status) {
-            case 'pending':
-                return '분석 대기 중입니다...';
-            case 'running':
-                return '웹사이트를 분석하고 있습니다...';
-            case 'completed':
-                return '분석이 완료되었습니다!';
-            case 'failed':
-                return '분석 중 오류가 발생했습니다.';
-            default:
-                return '알 수 없는 상태입니다.';
+    async getAnalysis(req, analysisId) {
+        return this.crawlerService.getAnalysis(analysisId, req.user.userId);
+    }
+    async getUserAnalyses(req, limit) {
+        const limitNum = limit ? parseInt(limit) : undefined;
+        return this.crawlerService.getUserAnalyses(req.user.userId, limitNum);
+    }
+    async downloadFile(req, analysisId, pageId, fileType, res) {
+        if (!['png', 'html'].includes(fileType)) {
+            throw new common_1.BadRequestException('Invalid file type. Must be png or html');
         }
+        const fileInfo = await this.crawlerService.downloadFile(analysisId, req.user.userId, fileType, pageId);
+        const fileStream = fs.createReadStream(fileInfo.filePath);
+        res.setHeader('Content-Type', fileInfo.contentType);
+        res.setHeader('Content-Disposition', `attachment; filename="${fileInfo.filename}"`);
+        fileStream.pipe(res);
+    }
+    async getScreenshot(analysisId, filename, res) {
+        const imagePath = `uploads/${analysisId}/screenshots/${filename}`;
+        const fullPath = require('path').join(process.cwd(), imagePath);
+        if (!fs.existsSync(fullPath)) {
+            throw new common_1.BadRequestException('Screenshot not found');
+        }
+        res.sendFile(fullPath);
+    }
+    async getTempScreenshot(tempId, filename, res) {
+        const imagePath = `temp/${tempId}/screenshots/${filename}`;
+        const fullPath = require('path').join(process.cwd(), imagePath);
+        if (!fs.existsSync(fullPath)) {
+            throw new common_1.BadRequestException('Screenshot not found');
+        }
+        res.sendFile(fullPath);
     }
 };
 exports.CrawlerController = CrawlerController;
 __decorate([
-    (0, common_1.Post)('analyze'),
-    __param(0, (0, common_1.Body)()),
-    __param(1, (0, common_1.Request)()),
+    (0, common_1.Post)('preview'),
+    __param(0, (0, common_1.Body)('url')),
+    __param(1, (0, common_1.Res)({ passthrough: true })),
+    __metadata("design:type", Function),
+    __metadata("design:paramtypes", [String, Object]),
+    __metadata("design:returntype", Promise)
+], CrawlerController.prototype, "getPreview", null);
+__decorate([
+    (0, common_1.UseGuards)(jwt_auth_guard_1.JwtAuthGuard),
+    (0, common_1.Post)('start'),
+    __param(0, (0, common_1.Request)()),
+    __param(1, (0, common_1.Body)()),
     __metadata("design:type", Function),
     __metadata("design:paramtypes", [Object, Object]),
     __metadata("design:returntype", Promise)
-], CrawlerController.prototype, "startAnalysis", null);
+], CrawlerController.prototype, "startCrawling", null);
 __decorate([
-    (0, common_1.Get)('analysis/:id'),
-    __param(0, (0, common_1.Param)('id')),
-    __param(1, (0, common_1.Request)()),
+    (0, common_1.UseGuards)(jwt_auth_guard_1.JwtAuthGuard),
+    (0, common_1.Get)('analysis/:id/status'),
+    __param(0, (0, common_1.Request)()),
+    __param(1, (0, common_1.Param)('id')),
     __metadata("design:type", Function),
-    __metadata("design:paramtypes", [String, Object]),
+    __metadata("design:paramtypes", [Object, String]),
+    __metadata("design:returntype", Promise)
+], CrawlerController.prototype, "getAnalysisStatus", null);
+__decorate([
+    (0, common_1.UseGuards)(jwt_auth_guard_1.JwtAuthGuard),
+    (0, common_1.Get)('analysis/:id'),
+    __param(0, (0, common_1.Request)()),
+    __param(1, (0, common_1.Param)('id')),
+    __metadata("design:type", Function),
+    __metadata("design:paramtypes", [Object, String]),
     __metadata("design:returntype", Promise)
 ], CrawlerController.prototype, "getAnalysis", null);
 __decorate([
-    (0, common_1.Get)('analysis/:id/visualization'),
-    __param(0, (0, common_1.Param)('id')),
-    __param(1, (0, common_1.Request)()),
-    __param(2, (0, common_1.Res)()),
+    (0, common_1.UseGuards)(jwt_auth_guard_1.JwtAuthGuard),
+    (0, common_1.Get)('analyses'),
+    __param(0, (0, common_1.Request)()),
+    __param(1, (0, common_1.Query)('limit')),
     __metadata("design:type", Function),
-    __metadata("design:paramtypes", [String, Object, Object]),
+    __metadata("design:paramtypes", [Object, String]),
     __metadata("design:returntype", Promise)
-], CrawlerController.prototype, "getVisualization", null);
+], CrawlerController.prototype, "getUserAnalyses", null);
 __decorate([
-    (0, common_1.Get)('analysis/:id/screenshot/:filename'),
-    __param(0, (0, common_1.Param)('id')),
-    __param(1, (0, common_1.Param)('filename')),
-    __param(2, (0, common_1.Request)()),
-    __param(3, (0, common_1.Res)()),
+    (0, common_1.UseGuards)(jwt_auth_guard_1.JwtAuthGuard),
+    (0, common_1.Get)('download/:analysisId/:pageId/:fileType'),
+    __param(0, (0, common_1.Request)()),
+    __param(1, (0, common_1.Param)('analysisId')),
+    __param(2, (0, common_1.Param)('pageId')),
+    __param(3, (0, common_1.Param)('fileType')),
+    __param(4, (0, common_1.Res)()),
     __metadata("design:type", Function),
-    __metadata("design:paramtypes", [String, String, Object, Object]),
-    __metadata("design:returntype", Promise)
-], CrawlerController.prototype, "getScreenshot", null);
-__decorate([
-    (0, common_1.Post)('analysis/:id/download'),
-    __param(0, (0, common_1.Param)('id')),
-    __param(1, (0, common_1.Body)()),
-    __param(2, (0, common_1.Request)()),
-    __metadata("design:type", Function),
-    __metadata("design:paramtypes", [String, Object, Object]),
+    __metadata("design:paramtypes", [Object, String, String, String, Object]),
     __metadata("design:returntype", Promise)
 ], CrawlerController.prototype, "downloadFile", null);
 __decorate([
-    (0, common_1.Get)('analysis/:id/file/:fileType'),
-    __param(0, (0, common_1.Param)('id')),
-    __param(1, (0, common_1.Param)('fileType')),
-    __param(2, (0, common_1.Request)()),
-    __param(3, (0, common_1.Res)()),
+    (0, common_1.Get)('screenshot/:analysisId/:filename'),
+    __param(0, (0, common_1.Param)('analysisId')),
+    __param(1, (0, common_1.Param)('filename')),
+    __param(2, (0, common_1.Res)()),
     __metadata("design:type", Function),
-    __metadata("design:paramtypes", [String, String, Object, Object]),
+    __metadata("design:paramtypes", [String, String, Object]),
     __metadata("design:returntype", Promise)
-], CrawlerController.prototype, "downloadFileStream", null);
+], CrawlerController.prototype, "getScreenshot", null);
 __decorate([
-    (0, common_1.Get)('history'),
-    __param(0, (0, common_1.Request)()),
+    (0, common_1.Get)('temp-screenshot/:tempId/:filename'),
+    __param(0, (0, common_1.Param)('tempId')),
+    __param(1, (0, common_1.Param)('filename')),
+    __param(2, (0, common_1.Res)()),
     __metadata("design:type", Function),
-    __metadata("design:paramtypes", [Object]),
+    __metadata("design:paramtypes", [String, String, Object]),
     __metadata("design:returntype", Promise)
-], CrawlerController.prototype, "getAnalysisHistory", null);
-__decorate([
-    (0, common_1.Get)('status/:id'),
-    __param(0, (0, common_1.Param)('id')),
-    __param(1, (0, common_1.Request)()),
-    __metadata("design:type", Function),
-    __metadata("design:paramtypes", [String, Object]),
-    __metadata("design:returntype", Promise)
-], CrawlerController.prototype, "getAnalysisStatus", null);
+], CrawlerController.prototype, "getTempScreenshot", null);
 exports.CrawlerController = CrawlerController = __decorate([
     (0, common_1.Controller)('crawler'),
-    (0, common_1.UseGuards)(jwt_auth_guard_1.JwtAuthGuard),
     __metadata("design:paramtypes", [crawler_service_1.CrawlerService,
         prisma_service_1.PrismaService])
 ], CrawlerController);

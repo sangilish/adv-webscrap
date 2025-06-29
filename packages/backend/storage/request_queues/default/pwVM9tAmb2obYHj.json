@@ -1,0 +1,9 @@
+{
+	"id": "pwVM9tAmb2obYHj",
+	"json": "{\"id\":\"pwVM9tAmb2obYHj\",\"url\":\"https://www.curated.media/apps/pmp_library/audience_segment/\",\"loadedUrl\":\"https://www.curated.media/apps/pmp_library/audience_segment/\",\"uniqueKey\":\"https://www.curated.media/apps/pmp_library/audience_segment\",\"method\":\"GET\",\"noRetry\":false,\"retryCount\":0,\"errorMessages\":[],\"headers\":{},\"userData\":{\"__crawlee\":{\"enqueueStrategy\":\"same-hostname\",\"state\":4}},\"handledAt\":\"2025-06-29T21:20:54.946Z\"}",
+	"method": "GET",
+	"orderNo": null,
+	"retryCount": 0,
+	"uniqueKey": "https://www.curated.media/apps/pmp_library/audience_segment",
+	"url": "https://www.curated.media/apps/pmp_library/audience_segment/"
+}

@@ -19,9 +19,11 @@ model User {
   updatedAt DateTime @updatedAt
   
   // SaaS 관련 필드
-  freeAnalysisCount Int @default(0) // 무료 분석 사용 횟수
+  plan      String   @default("FREE") // "FREE", "PRO", "ENTERPRISE"
+  freeAnalysisCount Int @default(0) // 무료 분석 사용 횟수 (월별 리셋)
   subscriptionType  String @default("free") // "free", "pro"
   subscriptionEndsAt DateTime?
+  lastResetDate DateTime @default(now()) // 마지막 월별 리셋 날짜
   
   // 관계
   analyses  Analysis[]
@@ -37,6 +39,7 @@ model Analysis {
   url         String
   title       String?
   status      String   @default("pending") // "pending", "running", "completed", "failed"
+  progress    Int      @default(0) // 0-100 진행률 표시
   pageCount   Int      @default(0)
   resultData  String?  // JSON 형태로 저장
   screenshotPath String?

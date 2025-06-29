@@ -5,64 +5,48 @@ export declare class CrawlerController {
     private crawlerService;
     private prisma;
     constructor(crawlerService: CrawlerService, prisma: PrismaService);
-    startAnalysis(body: {
+    getPreview(url: string, response: Response): Promise<any>;
+    startCrawling(req: any, body: {
         url: string;
         maxPages?: number;
-    }, req: any): Promise<{
+    }): Promise<{
         analysisId: string;
         message: string;
-        estimatedTime: string;
+        status: string;
     }>;
-    getAnalysis(analysisId: string, req: any): Promise<{
-        downloads: {
-            id: string;
-            createdAt: Date;
-            userId: number;
-            fileType: string;
-            filePath: string;
-            analysisId: string;
-        }[];
-    } & {
+    getAnalysisStatus(req: any, analysisId: string): Promise<{
         id: string;
-        createdAt: Date;
-        updatedAt: Date;
+        status: string;
+        progress: number;
+        pageCount: number;
+        url: string;
+        title: string | null;
+    }>;
+    getAnalysis(req: any, analysisId: string): Promise<{
+        resultData: any;
+        id: string;
+        userId: number;
         url: string;
         title: string | null;
         status: string;
+        progress: number;
         pageCount: number;
-        resultData: string | null;
         screenshotPath: string | null;
         htmlPath: string | null;
-        userId: number;
+        createdAt: Date;
+        updatedAt: Date;
     }>;
-    getVisualization(analysisId: string, req: any, res: Response): Promise<void>;
-    getScreenshot(analysisId: string, filename: string, req: any, res: Response): Promise<void>;
-    downloadFile(analysisId: string, body: {
-        fileType: 'png' | 'html' | 'json';
-    }, req: any): Promise<{
-        downloadUrl: string;
-        fileName: string;
-        message: string;
-    }>;
-    downloadFileStream(analysisId: string, fileType: string, req: any, res: Response): Promise<void>;
-    getAnalysisHistory(req: any): Promise<{
-        analyses: {
-            id: string;
-            url: string;
-            title: string | null;
-            status: string;
-            pageCount: number;
-            createdAt: Date;
-            updatedAt: Date;
-        }[];
-        total: number;
-    }>;
-    getAnalysisStatus(analysisId: string, req: any): Promise<{
+    getUserAnalyses(req: any, limit?: string): Promise<{
         id: string;
+        url: string;
+        title: string | null;
         status: string;
-        pageCount: number;
         progress: number;
-        message: string;
-    }>;
-    private getStatusMessage;
+        pageCount: number;
+        createdAt: Date;
+        updatedAt: Date;
+    }[]>;
+    downloadFile(req: any, analysisId: string, pageId: string, fileType: 'png' | 'html', res: Response): Promise<void>;
+    getScreenshot(analysisId: string, filename: string, res: Response): Promise<void>;
+    getTempScreenshot(tempId: string, filename: string, res: Response): Promise<void>;
 }

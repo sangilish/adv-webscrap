@@ -1,5 +1,6 @@
 import { PrismaService } from '../prisma/prisma.service';
 export interface CrawlResult {
+    id: string;
     url: string;
     title: string;
     pageType: string;
@@ -14,6 +15,11 @@ export interface CrawlResult {
     screenshotPath: string;
     htmlPath: string;
     timestamp: string;
+    metadata: {
+        wordCount: number;
+        imageCount: number;
+        linkCount: number;
+    };
 }
 export interface NetworkData {
     nodes: Array<{
@@ -41,40 +47,36 @@ export declare class CrawlerService {
     private classifyPageType;
     private generateNetworkData;
     private getColorByPageType;
-    private generateVisualizationHtml;
-    getAnalysis(analysisId: string, userId: number): Promise<({
-        downloads: {
-            id: string;
-            createdAt: Date;
-            userId: number;
-            fileType: string;
-            filePath: string;
-            analysisId: string;
-        }[];
-    } & {
+    getUserAnalyses(userId: number, limit?: number): Promise<{
         id: string;
-        createdAt: Date;
-        updatedAt: Date;
         url: string;
         title: string | null;
         status: string;
+        progress: number;
         pageCount: number;
-        resultData: string | null;
-        screenshotPath: string | null;
-        htmlPath: string | null;
-        userId: number;
-    }) | null>;
-    getUserAnalyses(userId: number): Promise<{
-        id: string;
         createdAt: Date;
         updatedAt: Date;
-        url: string;
-        title: string | null;
-        status: string;
-        pageCount: number;
-        resultData: string | null;
-        screenshotPath: string | null;
-        htmlPath: string | null;
-        userId: number;
     }[]>;
+    getAnalysis(analysisId: string, userId: number): Promise<{
+        resultData: any;
+        id: string;
+        userId: number;
+        url: string;
+        title: string | null;
+        status: string;
+        progress: number;
+        pageCount: number;
+        screenshotPath: string | null;
+        htmlPath: string | null;
+        createdAt: Date;
+        updatedAt: Date;
+    }>;
+    getPreviewAnalysis(url: string): Promise<any>;
+    private crawlSinglePage;
+    downloadFile(analysisId: string, userId: number, fileType: 'png' | 'html', pageId: string): Promise<{
+        filePath: string;
+        filename: string;
+        contentType: string;
+    }>;
+    private generateVisualizationHtml;
 }

@@ -1,11 +1,11 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { PlaywrightCrawler, Dataset } from 'crawlee';
-import { Page } from 'playwright';
+import { chromium } from 'playwright';
 import * as fs from 'fs';
 import * as path from 'path';
 
 export interface CrawlResult {
+  id: string;
   url: string;
   title: string;
   pageType: string;
@@ -17,6 +17,11 @@ export interface CrawlResult {
   screenshotPath: string;
   htmlPath: string;
   timestamp: string;
+  metadata: {
+    wordCount: number;
+    imageCount: number;
+    linkCount: number;
+  };
 }
 
 export interface NetworkData {
@@ -46,6 +51,29 @@ export class CrawlerService {
     targetUrl: string,
     maxPages: number = 5,
   ): Promise<string> {
+    // 사용자 플랜 확인
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      include: { analyses: true }
+    });
+
+    if (!user) {
+      throw new BadRequestException('User not found');
+    }
+
+    // Free 플랜 제한 확인 (월 10개)
+    const currentMonth = new Date();
+    currentMonth.setDate(1);
+    currentMonth.setHours(0, 0, 0, 0);
+    
+    const monthlyAnalyses = user.analyses.filter(
+      analysis => new Date(analysis.createdAt) >= currentMonth
+    );
+
+    if (user.plan === 'FREE' && monthlyAnalyses.length >= 10) {
+      throw new BadRequestException('Monthly crawling limit reached. Please upgrade to Pro.');
+    }
+
     // 분석 레코드 생성
     const analysis = await this.prisma.analysis.create({
       data: {
@@ -56,7 +84,7 @@ export class CrawlerService {
     });
 
     // 백그라운드에서 크롤링 실행
-    this.performCrawling(analysis.id, targetUrl, maxPages).catch((error) => {
+    this.performCrawling(analysis.id, targetUrl, maxPages, user.plan).catch((error) => {
       this.logger.error(`Crawling failed for analysis ${analysis.id}:`, error);
       this.prisma.analysis.update({
         where: { id: analysis.id },
@@ -71,10 +99,20 @@ export class CrawlerService {
     analysisId: string,
     startUrl: string,
     maxPages: number,
+    userPlan: string,
   ): Promise<void> {
     const results: CrawlResult[] = [];
     const visitedUrls = new Set<string>();
     const baseUrl = new URL(startUrl).origin;
+    
+    // 플랜별 페이지 제한
+    const planLimits = {
+      FREE: 5,
+      PRO: 100,
+      ENTERPRISE: 1000
+    };
+    
+    const actualMaxPages = Math.min(maxPages, planLimits[userPlan] || 5);
     
     // 결과 저장 디렉토리 생성
     const outputDir = path.join(process.cwd(), 'uploads', analysisId);
@@ -84,54 +122,69 @@ export class CrawlerService {
     await fs.promises.mkdir(screenshotsDir, { recursive: true });
     await fs.promises.mkdir(htmlDir, { recursive: true });
 
-    const crawler = new PlaywrightCrawler({
-      maxRequestsPerCrawl: maxPages,
-      requestHandler: async ({ page, request, enqueueLinks }) => {
-        const url = request.loadedUrl || request.url;
+    // Playwright 브라우저 실행
+    const browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+    });
+
+    try {
+      const urlsToVisit = [startUrl];
+      
+      while (urlsToVisit.length > 0 && results.length < actualMaxPages) {
+        const currentUrl = urlsToVisit.shift();
         
-        if (visitedUrls.has(url) || visitedUrls.size >= maxPages) {
-          return;
+        if (!currentUrl || visitedUrls.has(currentUrl)) {
+          continue;
         }
         
-        visitedUrls.add(url);
-        this.logger.log(`Crawling: ${url}`);
+        visitedUrls.add(currentUrl);
+        this.logger.log(`Crawling: ${currentUrl} (${results.length + 1}/${actualMaxPages})`);
 
+        const page = await context.newPage();
+        
         try {
-          // 페이지 대기
-          await page.waitForLoadState('networkidle', { timeout: 10000 });
+          await page.goto(currentUrl, { waitUntil: 'networkidle', timeout: 15000 });
           
           // 쿠키 팝업 제거
           await this.removeCookiePopups(page);
           
           // 데이터 추출
-          const result = await this.extractPageData(page, url, analysisId, screenshotsDir, htmlDir);
+          const result = await this.extractPageData(page, currentUrl, analysisId, screenshotsDir, htmlDir);
           results.push(result);
 
-          // 같은 도메인의 링크만 큐에 추가
-          if (visitedUrls.size < maxPages) {
-            await enqueueLinks({
-              selector: 'a[href]',
-              baseUrl: url,
-              transformRequestFunction: (req) => {
-                const reqUrl = new URL(req.url);
-                if (reqUrl.origin === baseUrl && !visitedUrls.has(req.url)) {
-                  return req;
+          // 진행률 업데이트
+          await this.prisma.analysis.update({
+            where: { id: analysisId },
+            data: { 
+              pageCount: results.length,
+              progress: Math.round((results.length / actualMaxPages) * 100)
+            },
+          });
+
+          // 같은 도메인의 새로운 링크 찾기
+          if (results.length < actualMaxPages) {
+            const links = await page.$$eval('a[href]', (anchors) => 
+              anchors.map(a => a.href).filter(href => href && href.startsWith('http'))
+            );
+            
+            for (const link of links) {
+              try {
+                const linkUrl = new URL(link);
+                if (linkUrl.origin === baseUrl && !visitedUrls.has(link) && !urlsToVisit.includes(link)) {
+                  urlsToVisit.push(link);
                 }
-                return false;
-              },
-            });
+              } catch (e) {
+                // 잘못된 URL 무시
+              }
+            }
           }
         } catch (error) {
-          this.logger.error(`Error crawling ${url}:`, error);
+          this.logger.error(`Error crawling ${currentUrl}:`, error);
+        } finally {
+          await page.close();
         }
-      },
-      failedRequestHandler: async ({ request }) => {
-        this.logger.error(`Failed to crawl: ${request.url}`);
-      },
-    });
-
-    try {
-      await crawler.run([startUrl]);
+      }
       
       // 네트워크 데이터 생성
       const networkData = this.generateNetworkData(results);
@@ -147,25 +200,24 @@ export class CrawlerService {
         data: {
           status: 'completed',
           pageCount: results.length,
-          resultData: JSON.stringify({
-            results,
-            networkData,
-          }),
-          title: results[0]?.title || 'Unknown',
+          progress: 100,
+          completedAt: new Date(),
         },
       });
 
-      this.logger.log(`Crawling completed for analysis ${analysisId}`);
+      this.logger.log(`Crawling completed for analysis ${analysisId}. ${results.length} pages crawled.`);
     } catch (error) {
-      this.logger.error(`Crawling failed:`, error);
+      this.logger.error(`Crawling failed for analysis ${analysisId}:`, error);
       await this.prisma.analysis.update({
         where: { id: analysisId },
         data: { status: 'failed' },
       });
+    } finally {
+      await browser.close();
     }
   }
 
-  private async removeCookiePopups(page: Page): Promise<void> {
+  private async removeCookiePopups(page: any): Promise<void> {
     const cookieSelectors = [
       '[class*="cookie"]',
       '[id*="cookie"]',
@@ -173,13 +225,42 @@ export class CrawlerService {
       '[id*="consent"]',
       '[class*="gdpr"]',
       '[id*="gdpr"]',
+      '[class*="banner"]',
+      '[class*="popup"]',
+      '[class*="modal"]'
     ];
 
     for (const selector of cookieSelectors) {
       try {
         const elements = await page.$$(selector);
         for (const element of elements) {
-          await element.evaluate((el) => el.remove());
+          const isVisible = await element.isVisible();
+          if (isVisible) {
+            await element.evaluate((el) => el.remove());
+          }
+        }
+      } catch (error) {
+        // 무시
+      }
+    }
+
+    // Accept 버튼 클릭 시도
+    const acceptSelectors = [
+      'button:has-text("Accept")',
+      'button:has-text("Accept All")',
+      'button:has-text("OK")',
+      'button:has-text("Got it")',
+      '[class*="accept"]',
+      '[id*="accept"]'
+    ];
+
+    for (const selector of acceptSelectors) {
+      try {
+        const button = await page.$(selector);
+        if (button && await button.isVisible()) {
+          await button.click();
+          await page.waitForTimeout(1000);
+          break;
         }
       } catch (error) {
         // 무시
@@ -188,7 +269,7 @@ export class CrawlerService {
   }
 
   private async extractPageData(
-    page: Page,
+    page: any,
     url: string,
     analysisId: string,
     screenshotsDir: string,
@@ -196,23 +277,25 @@ export class CrawlerService {
   ): Promise<CrawlResult> {
     const timestamp = new Date().toISOString();
     const urlHash = Buffer.from(url).toString('base64').replace(/[/+=]/g, '-');
+    const pageId = `page_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     
-    // 스크린샷 캡처
-    const screenshotFileName = `${urlHash}-${timestamp.replace(/[:.]/g, '-')}.png`;
-    const screenshotPath = path.join(screenshotsDir, screenshotFileName);
-    await page.screenshot({ 
-      path: screenshotPath, 
+    // 스크린샷 캡처 (전체 페이지)
+    const screenshotFilename = `${pageId}.png`;
+    const screenshotPath = path.join(screenshotsDir, screenshotFilename);
+    
+    await page.screenshot({
+      path: screenshotPath,
       fullPage: true,
       type: 'png'
     });
 
     // HTML 저장
-    const htmlFileName = `${urlHash}-${timestamp.replace(/[:.]/g, '-')}.html`;
-    const htmlPath = path.join(htmlDir, htmlFileName);
     const htmlContent = await page.content();
+    const htmlFilename = `${pageId}.html`;
+    const htmlPath = path.join(htmlDir, htmlFilename);
     await fs.promises.writeFile(htmlPath, htmlContent);
 
-    // 데이터 추출
+    // 페이지 데이터 추출
     const pageData = await page.evaluate(() => {
       const title = document.title || '';
       
@@ -220,22 +303,23 @@ export class CrawlerService {
       const links = Array.from(document.querySelectorAll('a[href]'))
         .map(a => (a as HTMLAnchorElement).href)
         .filter(href => href && !href.startsWith('javascript:') && !href.startsWith('mailto:'));
-      
+
       // 이미지 추출
       const images = Array.from(document.querySelectorAll('img[src]'))
-        .map(img => (img as HTMLImageElement).src);
-      
-      // 제목 추출
+        .map(img => (img as HTMLImageElement).src)
+        .filter(src => src);
+
+      // 헤딩 추출
       const headings = Array.from(document.querySelectorAll('h1, h2, h3, h4, h5, h6'))
         .map(h => ({
-          level: h.tagName,
+          level: h.tagName.toLowerCase(),
           text: h.textContent?.trim() || ''
         }))
         .filter(h => h.text);
-      
+
       // 폼 개수
       const forms = document.querySelectorAll('form').length;
-      
+
       // 텍스트 내용
       const textContent = document.body?.textContent?.trim() || '';
       
@@ -245,14 +329,24 @@ export class CrawlerService {
         images,
         headings,
         forms,
-        textContent: textContent.substring(0, 1000) // 처음 1000자만
+        textContent
       };
     });
 
     // 페이지 타입 분류
     const pageType = this.classifyPageType(url, pageData.title, pageData.headings);
 
-    return {
+    // 미리보기인지 확인 (analysisId가 preview_로 시작하는 경우)
+    const isPreview = analysisId.startsWith('preview_');
+    const screenshotUrl = isPreview 
+      ? `/temp/${analysisId}/screenshots/${screenshotFilename}`
+      : `/uploads/${analysisId}/screenshots/${screenshotFilename}`;
+    const htmlUrl = isPreview
+      ? `/temp/${analysisId}/html/${htmlFilename}`
+      : `/uploads/${analysisId}/html/${htmlFilename}`;
+
+    const result: CrawlResult = {
+      id: pageId,
       url,
       title: pageData.title,
       pageType,
@@ -261,48 +355,58 @@ export class CrawlerService {
       headings: pageData.headings,
       forms: pageData.forms,
       textContent: pageData.textContent,
-      screenshotPath: path.relative(process.cwd(), screenshotPath),
-      htmlPath: path.relative(process.cwd(), htmlPath),
+      screenshotPath: screenshotUrl,
+      htmlPath: htmlUrl,
       timestamp,
+      metadata: {
+        wordCount: pageData.textContent.split(/\s+/).length,
+        imageCount: pageData.images.length,
+        linkCount: pageData.links.length
+      }
     };
+
+    return result;
   }
 
   private classifyPageType(url: string, title: string, headings: any[]): string {
     const urlLower = url.toLowerCase();
     const titleLower = title.toLowerCase();
-    const headingText = headings.map(h => h.text.toLowerCase()).join(' ');
-    const allText = `${urlLower} ${titleLower} ${headingText}`;
-
-    if (urlLower.includes('/') && urlLower.split('/').length <= 4) return 'homepage';
-    if (allText.includes('about') || allText.includes('소개')) return 'about';
-    if (allText.includes('contact') || allText.includes('연락') || allText.includes('문의')) return 'contact';
-    if (allText.includes('product') || allText.includes('제품')) return 'product';
-    if (allText.includes('service') || allText.includes('서비스')) return 'service';
-    if (allText.includes('blog') || allText.includes('블로그') || allText.includes('news')) return 'blog';
     
-    return 'other';
+    if (urlLower.includes('/blog') || urlLower.includes('/news') || titleLower.includes('blog')) {
+      return 'blog';
+    } else if (urlLower.includes('/product') || urlLower.includes('/shop') || titleLower.includes('product')) {
+      return 'product';
+    } else if (urlLower.includes('/about') || titleLower.includes('about')) {
+      return 'about';
+    } else if (urlLower.includes('/contact') || titleLower.includes('contact')) {
+      return 'contact';
+    } else if (url === new URL(url).origin || urlLower.endsWith('/') && urlLower.split('/').length <= 4) {
+      return 'homepage';
+    }
+    return 'page';
   }
 
   private generateNetworkData(results: CrawlResult[]): NetworkData {
     const nodes = results.map(result => ({
-      id: result.url,
-      label: result.title || new URL(result.url).pathname,
+      id: result.id,
+      label: result.title || 'Untitled',
       color: this.getColorByPageType(result.pageType),
       type: result.pageType,
       url: result.url,
       title: result.title,
-      screenshot: result.screenshotPath,
+      screenshot: result.screenshotPath
     }));
 
     const edges: Array<{ from: string; to: string }> = [];
-    const urlSet = new Set(results.map(r => r.url));
-
-    results.forEach(result => {
-      result.links.forEach(link => {
-        if (urlSet.has(link) && link !== result.url) {
+    
+    // 링크 관계 생성
+    results.forEach(fromResult => {
+      fromResult.links.forEach(link => {
+        const toResult = results.find(r => r.url === link);
+        if (toResult && fromResult.id !== toResult.id) {
           edges.push({
-            from: result.url,
-            to: link,
+            from: fromResult.id,
+            to: toResult.id
           });
         }
       });
@@ -314,175 +418,296 @@ export class CrawlerService {
   private getColorByPageType(pageType: string): string {
     const colors = {
       homepage: '#FF6B6B',
-      about: '#4ECDC4',
+      about: '#4ECDC4', 
       contact: '#45B7D1',
       product: '#96CEB4',
-      service: '#FFEAA7',
-      blog: '#DDA0DD',
-      other: '#74B9FF',
+      blog: '#FFEAA7',
+      page: '#DDA0DD'
     };
-    return colors[pageType] || colors.other;
+    return colors[pageType] || colors.page;
   }
 
-  private generateVisualizationHtml(networkData: NetworkData, results: CrawlResult[]): string {
-    return `
-<!DOCTYPE html>
-<html lang="ko">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SiteMapper AI - 웹사이트 구조 분석</title>
-    <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #1a1a1a; color: #fff; }
-        .container { display: flex; height: 100vh; }
-        .map-container { flex: 1; position: relative; background: #2a2a2a; }
-        #mynetworkid { width: 100%; height: 100%; }
-        .sidebar { width: 400px; background: #333; padding: 20px; overflow-y: auto; }
-        .controls { position: absolute; top: 20px; left: 20px; z-index: 1000; }
-        .control-btn { 
-            background: #4CAF50; color: white; border: none; padding: 10px 15px; 
-            margin: 5px; border-radius: 5px; cursor: pointer; 
-        }
-        .control-btn:hover { background: #45a049; }
-        .legend { position: absolute; top: 20px; right: 20px; background: rgba(0,0,0,0.8); padding: 15px; border-radius: 10px; }
-        .legend-item { display: flex; align-items: center; margin: 5px 0; }
-        .legend-color { width: 20px; height: 20px; border-radius: 50%; margin-right: 10px; }
-        .page-info { background: #444; padding: 15px; border-radius: 10px; margin-bottom: 20px; }
-        .screenshot { max-width: 100%; border-radius: 5px; margin: 10px 0; }
-        .stats { background: #555; padding: 10px; border-radius: 5px; margin: 10px 0; font-size: 0.9em; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="map-container">
-            <div id="mynetworkid"></div>
-            <div class="controls">
-                <button class="control-btn" onclick="network.fit()">전체 보기</button>
-                <button class="control-btn" onclick="resetZoom()">줌 리셋</button>
-                <button class="control-btn" onclick="exportImage()">이미지 저장</button>
-            </div>
-            <div class="legend">
-                <h4>📋 페이지 타입</h4>
-                <div class="legend-item"><div class="legend-color" style="background: #FF6B6B;"></div><span>홈페이지</span></div>
-                <div class="legend-item"><div class="legend-color" style="background: #4ECDC4;"></div><span>소개</span></div>
-                <div class="legend-item"><div class="legend-color" style="background: #45B7D1;"></div><span>연락처</span></div>
-                <div class="legend-item"><div class="legend-color" style="background: #96CEB4;"></div><span>제품</span></div>
-                <div class="legend-item"><div class="legend-color" style="background: #FFEAA7;"></div><span>서비스</span></div>
-                <div class="legend-item"><div class="legend-color" style="background: #DDA0DD;"></div><span>블로그</span></div>
-                <div class="legend-item"><div class="legend-color" style="background: #74B9FF;"></div><span>기타</span></div>
-            </div>
-        </div>
-        <div class="sidebar">
-            <h3>📄 페이지 정보</h3>
-            <div id="page-details">
-                <div class="page-info">
-                    <p>노드를 클릭하여 페이지 정보를 확인하세요.</p>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <script>
-        const networkData = ${JSON.stringify(networkData)};
-        const resultsData = ${JSON.stringify(results)};
-        
-        const nodes = new vis.DataSet(networkData.nodes.map(node => ({
-            ...node,
-            shape: 'dot',
-            size: 30,
-            font: { color: '#ffffff', size: 14 },
-            borderWidth: 2,
-            borderColor: '#ffffff'
-        })));
-        
-        const edges = new vis.DataSet(networkData.edges.map(edge => ({
-            ...edge,
-            color: { color: '#666666', highlight: '#ffffff' },
-            width: 2,
-            arrows: { to: { enabled: true, scaleFactor: 0.5 } }
-        })));
-        
-        const container = document.getElementById('mynetworkid');
-        const data = { nodes, edges };
-        const options = {
-            physics: {
-                stabilization: { iterations: 100 },
-                barnesHut: { gravitationalConstant: -2000, springLength: 200 }
-            },
-            interaction: { hover: true, selectConnectedEdges: false },
-            layout: { randomSeed: 42 }
-        };
-        
-        const network = new vis.Network(container, data, options);
-        
-        network.on('click', function(params) {
-            if (params.nodes.length > 0) {
-                const nodeId = params.nodes[0];
-                const result = resultsData.find(r => r.url === nodeId);
-                if (result) {
-                    showPageDetails(result);
-                }
-            }
-        });
-        
-        function showPageDetails(result) {
-            const detailsDiv = document.getElementById('page-details');
-            detailsDiv.innerHTML = \`
-                <div class="page-info">
-                    <h4>\${result.title}</h4>
-                    <p><strong>URL:</strong> \${result.url}</p>
-                    <p><strong>타입:</strong> \${result.pageType}</p>
-                    <div class="stats">
-                        📝 제목: \${result.headings.length}개 | 
-                        🔗 링크: \${result.links.length}개 | 
-                        🖼️ 이미지: \${result.images.length}개 | 
-                        📋 폼: \${result.forms}개
-                    </div>
-                    <img src="\${result.screenshotPath}" class="screenshot" alt="스크린샷">
-                    <h5>📝 제목들</h5>
-                    <ul style="max-height: 120px; overflow-y: auto;">
-                        \${result.headings.map(h => \`<li>[\${h.level}] \${h.text}</li>\`).join('')}
-                    </ul>
-                </div>
-            \`;
-        }
-        
-        function resetZoom() {
-            network.moveTo({ scale: 1 });
-        }
-        
-        function exportImage() {
-            const canvas = container.querySelector('canvas');
-            const link = document.createElement('a');
-            link.download = 'website-map.png';
-            link.href = canvas.toDataURL();
-            link.click();
-        }
-    </script>
-</body>
-</html>
-    `;
-  }
-
-  async getAnalysis(analysisId: string, userId: number) {
-    return this.prisma.analysis.findFirst({
-      where: {
-        id: analysisId,
-        userId,
-      },
-      include: {
-        downloads: true,
-      },
+  // 사용자별 분석 조회 (Free 유저는 5개만)
+  async getUserAnalyses(userId: number, limit?: number) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId }
     });
-  }
 
-  async getUserAnalyses(userId: number) {
+    const actualLimit = user?.plan === 'FREE' ? 5 : (limit || 50);
+
     return this.prisma.analysis.findMany({
       where: { userId },
       orderBy: { createdAt: 'desc' },
-      take: 20,
+      take: actualLimit,
+      select: {
+        id: true,
+        url: true,
+        title: true,
+        status: true,
+        pageCount: true,
+        progress: true,
+        createdAt: true,
+        updatedAt: true
+      }
     });
+  }
+
+  // 분석 상세 조회
+  async getAnalysis(analysisId: string, userId: number) {
+    const analysis = await this.prisma.analysis.findFirst({
+      where: { 
+        id: analysisId, 
+        userId 
+      }
+    });
+
+    if (!analysis) {
+      throw new BadRequestException('Analysis not found');
+    }
+
+    return {
+      ...analysis,
+      resultData: analysis.resultData ? JSON.parse(analysis.resultData) : null
+    };
+  }
+
+  // 무료 미리보기 (로그인 없이 5개 페이지만)
+  async getPreviewAnalysis(url: string): Promise<any> {
+    this.logger.log(`Starting preview analysis for: ${url}`);
+    
+    const tempId = `preview_${Date.now()}`;
+    const results: CrawlResult[] = [];
+    const visitedUrls = new Set<string>();
+    
+    // 임시 디렉토리 생성
+    const tempDir = path.join(process.cwd(), 'temp', tempId);
+    const screenshotsDir = path.join(tempDir, 'screenshots');
+    const htmlDir = path.join(tempDir, 'html');
+    
+    await fs.promises.mkdir(screenshotsDir, { recursive: true });
+    await fs.promises.mkdir(htmlDir, { recursive: true });
+
+    const browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+    });
+
+    try {
+      const baseUrl = new URL(url).origin;
+      const urlsToVisit = [url];
+      const maxPages = 5; // 미리보기는 5페이지 제한
+      
+      while (urlsToVisit.length > 0 && results.length < maxPages) {
+        const currentUrl = urlsToVisit.shift();
+        
+        if (!currentUrl || visitedUrls.has(currentUrl)) {
+          continue;
+        }
+        
+        visitedUrls.add(currentUrl);
+        this.logger.log(`Preview crawling: ${currentUrl} (${results.length + 1}/${maxPages})`);
+        
+        const page = await context.newPage();
+        
+        try {
+          await page.goto(currentUrl, { waitUntil: 'networkidle', timeout: 15000 });
+          
+          // 쿠키 팝업 제거
+          await this.removeCookiePopups(page);
+          
+          // 데이터 추출
+          const result = await this.extractPageData(page, currentUrl, tempId, screenshotsDir, htmlDir);
+          results.push(result);
+          
+          // 같은 도메인의 새로운 링크 찾기
+          if (results.length < maxPages) {
+            const links = await page.$$eval('a[href]', (anchors) => 
+              anchors.map(a => a.href).filter(href => href && href.startsWith('http'))
+            );
+            
+            for (const link of links.slice(0, 10)) { // 최대 10개 링크만 확인
+              try {
+                const linkUrl = new URL(link);
+                if (linkUrl.origin === baseUrl && !visitedUrls.has(link) && !urlsToVisit.includes(link)) {
+                  urlsToVisit.push(link);
+                }
+              } catch (e) {
+                // 잘못된 URL 무시
+              }
+            }
+          }
+        } catch (error) {
+          this.logger.error(`Error crawling ${currentUrl}:`, error);
+        } finally {
+          await page.close();
+        }
+      }
+      
+      const networkData = this.generateNetworkData(results);
+      
+      this.logger.log(`Preview analysis completed for: ${url}, results: ${results.length}`);
+
+      return {
+        results,
+        networkData,
+        totalPages: results.length,
+        isPreview: true,
+        previewLimit: 5
+      };
+    } catch (error) {
+      this.logger.error(`Preview analysis failed for ${url}:`, error);
+      
+      // 오류 발생 시 기본 목업 데이터 반환
+      const mockResults: CrawlResult[] = [
+        {
+          id: `page_${Date.now()}_mock`,
+          url,
+          title: 'Sample Page Title',
+          pageType: 'homepage',
+          links: [],
+          images: [],
+          headings: [{ level: 'h1', text: 'Main Heading' }],
+          forms: 0,
+          textContent: 'Sample content from the crawled page.',
+          screenshotPath: `/temp/${tempId}/screenshots/mock.png`,
+          htmlPath: `/temp/${tempId}/html/mock.html`,
+          timestamp: new Date().toISOString(),
+          metadata: {
+            wordCount: 8,
+            imageCount: 0,
+            linkCount: 0
+          }
+        }
+      ];
+
+      const networkData = this.generateNetworkData(mockResults);
+      
+      return {
+        results: mockResults,
+        networkData,
+        totalPages: mockResults.length,
+        isPreview: true,
+        previewLimit: 5,
+        error: 'Crawling failed, showing sample data'
+      };
+    } finally {
+      await browser.close();
+    }
+  }
+
+  private async crawlSinglePage(
+    page: any,
+    url: string,
+    tempId: string,
+    screenshotsDir: string,
+    htmlDir: string,
+    results: CrawlResult[],
+    visitedUrls: Set<string>
+  ): Promise<void> {
+    if (visitedUrls.has(url)) return;
+    
+    visitedUrls.add(url);
+    this.logger.log(`Crawling: ${url} (${visitedUrls.size})`);
+
+    try {
+      await page.goto(url, { waitUntil: 'networkidle', timeout: 15000 });
+      
+      // 쿠키 팝업 제거
+      await this.removeCookiePopups(page);
+      
+      // 데이터 추출
+      const result = await this.extractPageData(page, url, tempId, screenshotsDir, htmlDir);
+      results.push(result);
+    } catch (error) {
+      this.logger.error(`Error crawling ${url}:`, error);
+    }
+  }
+
+  // 파일 다운로드 (로그인 필요)
+  async downloadFile(analysisId: string, userId: number, fileType: 'png' | 'html', pageId: string) {
+    const analysis = await this.prisma.analysis.findFirst({
+      where: { 
+        id: analysisId, 
+        userId,
+        status: 'completed'
+      }
+    });
+
+    if (!analysis) {
+      throw new BadRequestException('Analysis not found or not completed');
+    }
+
+    const resultData = analysis.resultData ? JSON.parse(analysis.resultData) : null;
+    if (!resultData?.results) {
+      throw new BadRequestException('No results found');
+    }
+
+    const page = resultData.results.find(r => r.id === pageId);
+    if (!page) {
+      throw new BadRequestException('Page not found');
+    }
+
+    const filePath = fileType === 'png' ? page.screenshotPath : page.htmlPath;
+    const fullPath = path.join(process.cwd(), filePath.replace('/uploads/', 'uploads/'));
+
+    if (!fs.existsSync(fullPath)) {
+      throw new BadRequestException('File not found');
+    }
+
+    return {
+      filePath: fullPath,
+      filename: path.basename(fullPath),
+      contentType: fileType === 'png' ? 'image/png' : 'text/html'
+    };
+  }
+
+  private generateVisualizationHtml(networkData: NetworkData, results: CrawlResult[]): string {
+    // 기존 시각화 HTML 생성 코드 유지
+    return `
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Website Structure Visualization</title>
+    <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; }
+        #network { height: 600px; border: 1px solid #ccc; }
+        .info-panel { margin-top: 20px; padding: 15px; background: #f5f5f5; border-radius: 8px; }
+        .page-info { margin: 10px 0; padding: 10px; background: white; border-radius: 4px; }
+    </style>
+</head>
+<body>
+    <h1>Website Structure Analysis</h1>
+    <div id="network"></div>
+    <div class="info-panel">
+        <h3>Analysis Summary</h3>
+        <p><strong>Total Pages:</strong> ${results.length}</p>
+        <p><strong>Total Links:</strong> ${results.reduce((sum, r) => sum + r.links.length, 0)}</p>
+        <p><strong>Total Images:</strong> ${results.reduce((sum, r) => sum + r.images.length, 0)}</p>
+    </div>
+    
+    <script>
+        const nodes = new vis.DataSet(${JSON.stringify(networkData.nodes)});
+        const edges = new vis.DataSet(${JSON.stringify(networkData.edges)});
+        const container = document.getElementById('network');
+        const data = { nodes: nodes, edges: edges };
+        const options = {
+            nodes: {
+                shape: 'dot',
+                size: 20,
+                font: { size: 12 }
+            },
+            edges: {
+                arrows: 'to'
+            },
+            physics: {
+                enabled: true,
+                stabilization: { iterations: 100 }
+            }
+        };
+        const network = new vis.Network(container, data, options);
+    </script>
+</body>
+</html>`;
   }
 } 
