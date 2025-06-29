@@ -1,0 +1,85 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+model User {
+  id        Int      @id @default(autoincrement())
+  email     String   @unique
+  password  String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  // SaaS 관련 필드
+  freeAnalysisCount Int @default(0) // 무료 분석 사용 횟수
+  subscriptionType  String @default("free") // "free", "pro"
+  subscriptionEndsAt DateTime?
+  
+  // 관계
+  analyses  Analysis[]
+  payments  Payment[]
+  downloads Download[]
+  
+  @@map("users")
+}
+
+model Analysis {
+  id          String   @id @default(cuid())
+  userId      Int
+  url         String
+  title       String?
+  status      String   @default("pending") // "pending", "running", "completed", "failed"
+  pageCount   Int      @default(0)
+  resultData  String?  // JSON 형태로 저장
+  screenshotPath String?
+  htmlPath    String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  // 관계
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  downloads   Download[]
+  
+  @@map("analyses")
+}
+
+model Payment {
+  id              String   @id @default(cuid())
+  userId          Int
+  stripeSessionId String   @unique
+  amount          Int      // 원 단위
+  currency        String   @default("KRW")
+  status          String   @default("pending") // "pending", "completed", "failed"
+  type            String   // "additional_pages", "subscription"
+  description     String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  
+  // 관계
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@map("payments")
+}
+
+model Download {
+  id         String   @id @default(cuid())
+  userId     Int
+  analysisId String
+  fileType   String   // "png", "html", "json"
+  filePath   String
+  createdAt  DateTime @default(now())
+  
+  // 관계
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  analysis   Analysis @relation(fields: [analysisId], references: [id], onDelete: Cascade)
+  
+  @@map("downloads")
+}

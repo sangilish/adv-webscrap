@@ -1,0 +1,20 @@
+{
+  "name": "web-structure-analyzer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A full-stack application to crawl and visualize website structures.",
+  "scripts": {
+    "dev:backend": "npm run dev --workspace=backend",
+    "dev:frontend": "npm run dev --workspace=frontend",
+    "build:backend": "npm run build --workspace=backend",
+    "build:frontend": "npm run build --workspace=frontend"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "author": "Your Name",
+  "license": "ISC",
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.1.11"
+  }
+}
