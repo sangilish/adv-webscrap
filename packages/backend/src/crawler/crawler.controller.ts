@@ -38,19 +38,34 @@ export class CrawlerController {
     response.header('Access-Control-Allow-Headers', 'Content-Type, Accept, Authorization');
     
     if (!url) {
+      console.log('No URL provided');
       throw new BadRequestException('URL is required');
     }
 
     try {
       new URL(url); // URL 유효성 검사
+      console.log('URL validation passed');
     } catch (error) {
+      console.log('URL validation failed:', error.message);
       throw new BadRequestException('Invalid URL format');
     }
 
-    console.log('Calling crawlerService.getPreviewAnalysis...');
-    const result = await this.crawlerService.getPreviewAnalysis(url);
-    console.log('Service returned:', result);
-    return result;
+    try {
+      console.log('Calling crawlerService.getPreviewAnalysis...');
+      const result = await this.crawlerService.getPreviewAnalysis(url);
+      console.log('Service returned result with', result.results.length, 'pages');
+      return result;
+    } catch (error) {
+      console.error('Error in getPreviewAnalysis:', error);
+      return {
+        results: [],
+        networkData: { nodes: [], edges: [] },
+        totalPages: 0,
+        isPreview: true,
+        previewLimit: 30,
+        message: `크롤링 중 오류가 발생했습니다: ${error.message}`
+      };
+    }
   }
 
   // 실제 크롤링 시작 (로그인 필요)
@@ -169,13 +184,45 @@ export class CrawlerController {
     @Param('filename') filename: string,
     @Res() res: Response
   ) {
+    // 실제 스크린샷이 저장되는 경로로 수정
     const imagePath = `temp/${tempId}/screenshots/${filename}`;
     const fullPath = require('path').join(process.cwd(), imagePath);
 
     if (!fs.existsSync(fullPath)) {
+      console.error('Screenshot not found at path:', fullPath);
       throw new BadRequestException('Screenshot not found');
     }
 
     res.sendFile(fullPath);
+  }
+
+  // 페이지 상세 정보 가져오기 (스크린샷 + HTML)
+  @Post('page-details')
+  async getPageDetails(@Body('url') url: string, @Res({ passthrough: true }) response: Response) {
+    console.log('Page details endpoint called with URL:', url);
+    
+    // CORS 헤더 설정
+    response.header('Access-Control-Allow-Origin', 'http://localhost:3000');
+    response.header('Access-Control-Allow-Credentials', 'true');
+    response.header('Access-Control-Allow-Methods', 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS');
+    response.header('Access-Control-Allow-Headers', 'Content-Type, Accept, Authorization');
+    
+    if (!url) {
+      throw new BadRequestException('URL is required');
+    }
+
+    try {
+      new URL(url); // URL 유효성 검사
+    } catch (error) {
+      throw new BadRequestException('Invalid URL format');
+    }
+
+    try {
+      const result = await this.crawlerService.getPageDetails(url);
+      return result;
+    } catch (error) {
+      console.error('Error in getPageDetails:', error);
+      throw new BadRequestException(`페이지 상세 정보를 가져오는 중 오류가 발생했습니다: ${error.message}`);
+    }
   }
 } 

@@ -120,6 +120,8 @@ export default function AnalyzePage() {
   const [viewMode, setViewMode] = useState<ViewMode>('structure')
   const [result, setResult] = useState<AnalysisResult | null>(null)
   const [isCheckingAuth, setIsCheckingAuth] = useState(false)
+  const [loadingPageDetails, setLoadingPageDetails] = useState(false)
+  const [pageDetailsCache, setPageDetailsCache] = useState<Record<string, any>>({})
 
   useEffect(() => {
     if (!url) {
@@ -313,10 +315,10 @@ export default function AnalyzePage() {
   const getScreenshotUrl = (screenshotPath: string) => {
     // Next.js API 프록시를 통한 스크린샷 URL 반환 (CORS 우회)
     if (screenshotPath) {
-      // 임시 미리보기 스크린샷 경로 처리: /temp/preview_xxx/screenshots/xxx.png
+      // 임시 미리보기 스크린샷 경로 처리: /temp/preview_xxx/screenshots/xxx.png 또는 details_xxx
       if (screenshotPath.includes('/temp/')) {
         const pathParts = screenshotPath.split('/')
-        const tempId = pathParts.find(part => part.startsWith('preview_'))
+        const tempId = pathParts.find(part => part.startsWith('preview_') || part.startsWith('details_'))
         const filename = pathParts[pathParts.length - 1]
         
         if (tempId && filename) {
@@ -352,6 +354,68 @@ export default function AnalyzePage() {
     `)
   }
 
+  // 페이지 상세 정보 가져오기 (스크린샷 + HTML)
+  const loadPageDetails = async (url: string) => {
+    try {
+      console.log('Loading page details for:', url)
+      
+      const response = await fetch('/api/crawler/page-details', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ url }),
+      })
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`)
+      }
+
+      const data = await response.json()
+      console.log('Page details loaded:', data)
+      
+      return data
+    } catch (error) {
+      console.error('Failed to load page details:', error)
+      throw error
+    }
+  }
+
+  // 노드 클릭 핸들러 - 상세 정보 로드
+  const handleNodeClick = async (node: PageNode) => {
+    setSelectedNode(node)
+    
+    // 이미 스크린샷이 있거나 캐시에 있으면 추가 로드하지 않음
+    if (node.screenshotPath || pageDetailsCache[node.url]) {
+      return
+    }
+
+    // 상세 정보 로드
+    setLoadingPageDetails(true)
+    try {
+      const details = await loadPageDetails(node.url)
+      
+      // 캐시에 저장
+      setPageDetailsCache(prev => ({
+        ...prev,
+        [node.url]: details
+      }))
+      
+      // 선택된 노드 업데이트
+      const updatedNode = {
+        ...node,
+        screenshotPath: details.screenshotPath,
+        htmlPath: details.htmlPath
+      }
+      setSelectedNode(updatedNode)
+      
+    } catch (error) {
+      console.error('Failed to load page details:', error)
+    } finally {
+      setLoadingPageDetails(false)
+    }
+  }
+
   const renderTreeNode = (node: PageNode, visited = new Set<string>()): React.ReactNode => {
     // 순환 참조로 인한 무한 재귀 방지
     if (visited.has(node.id)) return null;
@@ -368,7 +432,7 @@ export default function AnalyzePage() {
               : 'hover:bg-white/60 text-gray-700'
           }`}
           style={{ marginLeft: `${indentLevel}px` }}
-          onClick={() => setSelectedNode(node)}
+          onClick={() => handleNodeClick(node)}
         >
           <div className="flex items-center flex-1">
             {node.children.length > 0 && (
@@ -786,20 +850,40 @@ export default function AnalyzePage() {
                       {/* Page Screenshot */}
                       <div className="bg-gray-100 rounded-2xl p-4 border-2 border-dashed border-gray-300">
                         <div className="text-center">
-                          {selectedNode.screenshotPath ? (
-                            <div>
-                              <img 
-                                src={getScreenshotUrl(selectedNode.screenshotPath)}
-                                alt={`Screenshot of ${selectedNode.title}`}
-                                className="w-full max-h-96 object-contain rounded-lg mb-4"
-                                onError={(e) => {
-                                  e.currentTarget.style.display = 'none'
-                                  const nextElement = e.currentTarget.nextElementSibling as HTMLElement
-                                  if (nextElement) {
-                                    nextElement.style.display = 'block'
-                                  }
-                                }}
-                              />
+                          {loadingPageDetails ? (
+                            <div className="py-12">
+                              <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-purple-500 mx-auto mb-4"></div>
+                              <p className="text-gray-600">페이지 상세 정보를 불러오는 중...</p>
+                            </div>
+                          ) : selectedNode.screenshotPath || pageDetailsCache[selectedNode.url]?.screenshotPath ? (
+                            <div className="relative">
+                              {(() => {
+                                const locked = isPreview && result && result.results.findIndex(r => r.id === selectedNode.id) >= (result?.previewLimit || 5)
+                                return (
+                                  <>
+                                    <img
+                                      src={getScreenshotUrl(selectedNode.screenshotPath || pageDetailsCache[selectedNode.url]?.screenshotPath)}
+                                      alt={`Screenshot of ${selectedNode.title}`}
+                                      className={`w-full max-h-96 object-contain rounded-lg mb-4 ${locked ? 'filter blur-sm opacity-50' : ''}`}
+                                      onError={(e) => {
+                                        e.currentTarget.style.display = 'none'
+                                        const nextElement = e.currentTarget.nextElementSibling as HTMLElement
+                                        if (nextElement) nextElement.style.display = 'block'
+                                      }}
+                                    />
+                                    {locked && (
+                                      <div className="absolute inset-0 flex flex-col items-center justify-center text-center px-4">
+                                        <div className="bg-white/80 backdrop-blur-lg p-4 rounded-xl shadow-lg">
+                                          <p className="font-semibold text-gray-800 mb-2">Premium Screenshot</p>
+                                          <p className="text-gray-600 text-sm mb-4">Sign up to view full-resolution image</p>
+                                          <Link href="/signup" className="inline-block bg-gradient-to-r from-purple-500 to-blue-500 text-white px-4 py-2 rounded-lg text-sm font-medium hover:from-purple-600 hover:to-blue-600">Sign Up</Link>
+                                        </div>
+                                      </div>
+                                    )}
+                                  </>
+                                )
+                              })()}
+                              
                               <div style={{ display: 'none' }}>
                                 <svg className="w-16 h-16 text-gray-400 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
@@ -819,25 +903,27 @@ export default function AnalyzePage() {
                         </div>
                       </div>
 
-                      {/* Download Buttons */}
+                      {/* Get Details Buttons */}
                       <div className="flex space-x-3">
                         <button
-                          onClick={() => handleDownload(selectedNode.id, 'png')}
-                          className="flex-1 bg-gradient-to-r from-blue-500 to-cyan-500 text-white font-semibold py-3 px-4 rounded-xl hover:from-blue-600 hover:to-cyan-600 transition-all shadow-lg hover:shadow-xl"
+                          onClick={() => handleNodeClick(selectedNode)}
+                          disabled={loadingPageDetails || selectedNode.screenshotPath || pageDetailsCache[selectedNode.url]}
+                          className="flex-1 bg-gradient-to-r from-blue-500 to-cyan-500 text-white font-semibold py-3 px-4 rounded-xl hover:from-blue-600 hover:to-cyan-600 transition-all shadow-lg hover:shadow-xl disabled:opacity-50 disabled:cursor-not-allowed"
                         >
                           <svg className="w-5 h-5 inline mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
                           </svg>
-                          Download PNG
+                          {selectedNode.screenshotPath || pageDetailsCache[selectedNode.url] ? 'PNG Ready' : 'Get PNG'}
                         </button>
                         <button
-                          onClick={() => handleDownload(selectedNode.id, 'html')}
-                          className="flex-1 bg-gradient-to-r from-green-500 to-emerald-500 text-white font-semibold py-3 px-4 rounded-xl hover:from-green-600 hover:to-emerald-600 transition-all shadow-lg hover:shadow-xl"
+                          onClick={() => handleNodeClick(selectedNode)}
+                          disabled={loadingPageDetails || selectedNode.htmlPath || pageDetailsCache[selectedNode.url]}
+                          className="flex-1 bg-gradient-to-r from-green-500 to-emerald-500 text-white font-semibold py-3 px-4 rounded-xl hover:from-green-600 hover:to-emerald-600 transition-all shadow-lg hover:shadow-xl disabled:opacity-50 disabled:cursor-not-allowed"
                         >
                           <svg className="w-5 h-5 inline mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                           </svg>
-                          Download HTML
+                          {selectedNode.htmlPath || pageDetailsCache[selectedNode.url] ? 'HTML Ready' : 'Get HTML'}
                         </button>
                       </div>
 

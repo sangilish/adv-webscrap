@@ -9,15 +9,21 @@ export async function POST(request: NextRequest) {
     
     console.log('Frontend API proxy called with:', body);
     
-    // 백엔드 API로 요청 프록시
+    // 백엔드 API로 요청 프록시 (timeout 10분으로 설정)
     try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10 * 60 * 1000); // 10분 timeout
+      
       const response = await fetch('http://localhost:3003/crawler/preview', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(body),
+        signal: controller.signal,
       });
+      
+      clearTimeout(timeoutId);
 
       if (response.ok) {
         const data = await response.json();
