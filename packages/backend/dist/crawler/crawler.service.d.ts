@@ -94,4 +94,5 @@ export declare class CrawlerService {
         contentType: string;
     }>;
     private detectSPANavigation;
+    private clickCookieAccept;
 }

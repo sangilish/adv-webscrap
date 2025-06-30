@@ -440,6 +440,9 @@ export class CrawlerService {
     });
     await page.waitForTimeout(2000);
 
+    // 쿠키 동의 버튼 처리 (팝업이 스크린샷에 보이지 않도록)
+    await this.clickCookieAccept(page);
+
     // Screenshot
     const screenshotFilename = `${pageId}.png`;
     const screenshotsDir = path.join(outputDir, 'screenshots');
@@ -1224,5 +1227,56 @@ export class CrawlerService {
     discoveredUrls.forEach((route, i) => console.log(`  ${i + 1}. ${route}`));
     
     return Array.from(discoveredUrls);
+  }
+
+  private async clickCookieAccept(page: Page): Promise<void> {
+    const selectors = [
+      // 일반 텍스트
+      'button:has-text("Accept")',
+      'button:has-text("Accept All")',
+      'button:has-text("Agree")',
+      'button:has-text("Agree and Close")',
+      'button:has-text("OK")',
+      'button:has-text("Got it")',
+      'button:has-text("동의")',
+      'button:has-text("모두 동의")',
+      // Didomi 전용
+      '#didomi-notice-agree-button',
+      'button#didomi-notice-agree-button',
+      '[id="didomi-notice-agree-button"]',
+      // 속성 기반
+      '[id*="accept"]',
+      '[class*="accept"]',
+      '[id*="agree"]',
+      '[class*="agree"]'
+    ];
+    for (const selector of selectors) {
+      try {
+        const btn = await page.$(selector);
+        if (btn) {
+          const box = await btn.boundingBox();
+          if (box) {
+            console.log(`✅ 쿠키 동의 버튼 클릭: ${selector}`);
+            await btn.click({ timeout: 3000 }).catch(() => {});
+            await page.waitForTimeout(1500);
+            break;
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+
+    // 팝업이 여전히 보이면 강제 제거
+    try {
+      const banner = await page.$('#didomi-notice');
+      if (banner) {
+        const visible = await banner.isVisible();
+        if (visible) {
+          console.log('⚠️ 배너가 아직 남아 있어 강제 제거합니다');
+          await banner.evaluate(el => el.remove());
+        }
+      }
+    } catch {/* ignore */}
   }
 }
