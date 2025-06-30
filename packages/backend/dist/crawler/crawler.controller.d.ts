@@ -25,7 +25,8 @@ export declare class CrawlerController {
     getAnalysis(req: any, analysisId: string): Promise<{
         resultData: any;
         id: string;
-        userId: number;
+        createdAt: Date;
+        updatedAt: Date;
         url: string;
         title: string | null;
         status: string;
@@ -33,18 +34,17 @@ export declare class CrawlerController {
         pageCount: number;
         screenshotPath: string | null;
         htmlPath: string | null;
-        createdAt: Date;
-        updatedAt: Date;
+        userId: number;
     }>;
     getUserAnalyses(req: any, limit?: string): Promise<{
         id: string;
+        createdAt: Date;
+        updatedAt: Date;
         url: string;
         title: string | null;
         status: string;
         progress: number;
         pageCount: number;
-        createdAt: Date;
-        updatedAt: Date;
     }[]>;
     downloadFile(req: any, analysisId: string, pageId: string, fileType: 'png' | 'html', res: Response): Promise<void>;
     getScreenshot(analysisId: string, filename: string, res: Response): Promise<void>;

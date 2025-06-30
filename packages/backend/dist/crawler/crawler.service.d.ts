@@ -52,30 +52,29 @@ export declare class CrawlerService {
     private readonly logger;
     constructor(prisma: PrismaService);
     startCrawling(userId: number, targetUrl: string, maxPages?: number): Promise<string>;
-    private performCrawling;
-    private removeCookiePopups;
-    private crawlSinglePage;
-    private extractLinks;
+    private performOptimizedCrawling;
+    private fastUrlDiscovery;
+    private parallelCrawl;
+    private fastCrawlPage;
+    private quickRemoveCookies;
+    getPreviewAnalysis(url: string): Promise<AnalysisResult>;
     private generateNetworkData;
     private generateVisualizationHtml;
-    private sanitizeFilename;
-    private sleep;
-    private randomDelay;
-    private isSameDomain;
     getUserAnalyses(userId: number, limit?: number): Promise<{
         id: string;
+        createdAt: Date;
+        updatedAt: Date;
         url: string;
         title: string | null;
         status: string;
         progress: number;
         pageCount: number;
-        createdAt: Date;
-        updatedAt: Date;
     }[]>;
     getAnalysis(analysisId: string, userId: number): Promise<{
         resultData: any;
         id: string;
-        userId: number;
+        createdAt: Date;
+        updatedAt: Date;
         url: string;
         title: string | null;
         status: string;
@@ -83,16 +82,11 @@ export declare class CrawlerService {
         pageCount: number;
         screenshotPath: string | null;
         htmlPath: string | null;
-        createdAt: Date;
-        updatedAt: Date;
+        userId: number;
     }>;
-    getPreviewAnalysis(url: string): Promise<AnalysisResult>;
-    private performDFSCrawl;
     downloadFile(analysisId: string, userId: number, fileType: 'png' | 'html', pageId: string): Promise<{
         filePath: string;
         filename: string;
         contentType: string;
     }>;
-    private detectSPANavigation;
-    private clickCookieAccept;
 }

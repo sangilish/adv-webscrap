@@ -3,6 +3,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { chromium, Browser, BrowserContext, Page } from 'playwright';
 import * as fs from 'fs';
 import * as path from 'path';
+import pLimit from 'p-limit';
 
 export interface CrawlResult {
   id: string;
@@ -98,7 +99,7 @@ export class CrawlerService {
     });
 
     // 백그라운드에서 크롤링 실행
-    this.performCrawling(analysis.id, targetUrl, maxPages, user.plan).catch((error) => {
+    this.performOptimizedCrawling(analysis.id, targetUrl, maxPages, user.plan).catch((error) => {
       this.logger.error(`Crawling failed for analysis ${analysis.id}:`, error);
       this.prisma.analysis.update({
         where: { id: analysis.id },
@@ -109,17 +110,19 @@ export class CrawlerService {
     return analysis.id;
   }
 
-  private async performCrawling(
+  private async performOptimizedCrawling(
     analysisId: string,
     startUrl: string,
     maxPages: number,
     userPlan: string,
   ): Promise<void> {
+    const startTime = Date.now();
     const results: CrawlResult[] = [];
     const visitedUrls = new Set<string>();
     const baseUrl = new URL(startUrl).origin;
+    const sitemap: Record<string, string[]> = {};
     
-    // 플랜별 페이지 제한 (FREE도 충분히 탐색 가능하도록 확대)
+    // 플랜별 페이지 제한
     const planLimits = {
       FREE: 100,
       PRO: 500,
@@ -137,130 +140,51 @@ export class CrawlerService {
     await fs.promises.mkdir(htmlDir, { recursive: true });
 
     const browser = await chromium.launch({ 
-      headless: true
-    });
-    const context = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-      viewport: { width: 1400, height: 900 }
+      headless: true,
+      args: ['--no-sandbox', '--disable-dev-shm-usage']
     });
 
     try {
-      const urlsToVisit = [startUrl];
+      // Phase 1: Fast URL Discovery
+      this.logger.log('🚀 Phase 1: Fast URL Discovery');
+      const discoveredUrls = await this.fastUrlDiscovery(browser, startUrl, actualMaxPages);
       
-      while (urlsToVisit.length > 0 && results.length < actualMaxPages) {
-        const currentUrl = urlsToVisit.shift();
-        
-        if (!currentUrl || visitedUrls.has(currentUrl)) {
-          continue;
-        }
-        
-        visitedUrls.add(currentUrl);
-        this.logger.log(`Crawling: ${currentUrl} (${results.length + 1}/${actualMaxPages})`);
+      // Phase 2: Parallel Content Extraction
+      this.logger.log('🚀 Phase 2: Parallel Content Extraction');
+      const crawlResults = await this.parallelCrawl(
+        browser, 
+        Array.from(discoveredUrls).slice(0, actualMaxPages),
+        outputDir,
+        analysisId
+      );
 
-        const page = await context.newPage();
-        // 페이지 콘솔 에러 로깅
-        page.on('pageerror', (err) => this.logger.error('Page error:', err));
-        
-        try {
-          // ChatGPT 분석 반영: networkidle 타임아웃 문제 해결
-          console.log(`🔍 Loading page: ${currentUrl}`);
-          const response = await page.goto(currentUrl, { 
-            waitUntil: 'domcontentloaded', 
-            timeout: 30000 
-          });
+      // Combine results
+      results.push(...crawlResults);
 
-          // 응답 상태 확인
-          if (!response || !response.ok()) {
-            console.log(`❌ Page load failed with status: ${response?.status()}`);
-            continue;
-          }
-
-          // Curated.media WebSocket/SSE 지속 대응: networkidle 대신 DOM 로드 후 대기
-          await page.waitForTimeout(3000);
-          console.log(`✅ Page loaded and ready: ${currentUrl}`);
-
-          // 디버깅: 페이지 내용 확인
-          const pageTitle = await page.title();
-          const pageContentLength = (await page.content()).length;
-          console.log(`📊 Page Debug Info:`);
-          console.log(`  - Title: "${pageTitle}"`);
-          console.log(`  - Content Length: ${pageContentLength} chars`);
-          console.log(`  - Response Status: ${response?.status()}`);
-
-          // NEW: 고정 뷰포트 설정 (전체 페이지 스크린샷 안정화)
-          await page.setViewportSize({ width: 1280, height: 800 });
-
-          // SPA 네비게이션 탐지 (첫 번째 페이지에서만)
-          if (results.length === 0) {
-            console.log('🔍 Detecting SPA navigation patterns...');
-            const spaRoutes = await this.detectSPANavigation(page, baseUrl);
-            console.log(`🎯 Found ${spaRoutes.length} potential SPA routes`);
-            
-            // SPA 라우트를 크롤링 큐에 추가
-            for (const route of spaRoutes) {
-              if (!visitedUrls.has(route) && !urlsToVisit.includes(route)) {
-                urlsToVisit.push(route);
-                console.log(`➕ Added SPA route to queue: ${route}`);
-              }
-            }
-          }
-
-          // 데이터 추출
-          const result = await this.crawlSinglePage(page, currentUrl, outputDir);
-          results.push(result);
-
-          // 진행률 업데이트
-          await this.prisma.analysis.update({
-            where: { id: analysisId },
-            data: { 
-              pageCount: results.length,
-              progress: Math.round((results.length / actualMaxPages) * 100)
-            },
-          });
-
-          // 같은 도메인의 새로운 링크 찾기
-          if (results.length < actualMaxPages) {
-            const links = await this.extractLinks(page);
-            
-            for (const link of links) {
-              try {
-                const linkUrl = new URL(link);
-                if (linkUrl.origin === baseUrl && !visitedUrls.has(link) && !urlsToVisit.includes(link)) {
-                  urlsToVisit.push(link);
-                }
-              } catch (e) {
-                // 잘못된 URL 무시
-              }
-            }
-          }
-        } catch (error) {
-          this.logger.error(`Error crawling ${currentUrl}:`, error);
-        } finally {
-          await page.close();
-        }
-      }
+      // Generate network data
+      const networkData = this.generateNetworkData(results, sitemap);
       
-      // 네트워크 데이터 생성
-      const networkData = this.generateNetworkData(results, {});
-      
-      // 시각화 HTML 생성
+      // Generate visualization
       const visualizationHtml = this.generateVisualizationHtml(networkData, results);
       const htmlPath = path.join(outputDir, 'visualization.html');
       await fs.promises.writeFile(htmlPath, visualizationHtml);
 
-      // 분석 완료 업데이트
+      // Update analysis
       await this.prisma.analysis.update({
         where: { id: analysisId },
         data: {
           status: 'completed',
           pageCount: results.length,
           progress: 100,
+          title: results[0]?.title || 'Website Analysis'
         },
       });
 
-      this.logger.log(`Crawling completed for analysis ${analysisId}. ${results.length} pages crawled.`);
+      const duration = (Date.now() - startTime) / 1000;
+      this.logger.log(`✅ Crawling completed in ${duration}s. ${results.length} pages crawled.`);
+
     } catch (error) {
-      this.logger.error(`Crawling failed for analysis ${analysisId}:`, error);
+      this.logger.error(`Crawling failed:`, error);
       await this.prisma.analysis.update({
         where: { id: analysisId },
         data: { status: 'failed' },
@@ -270,452 +194,388 @@ export class CrawlerService {
     }
   }
 
-  private async removeCookiePopups(page: any): Promise<void> {
-    // 다양한 쿠키 팝업 selectors
-    const cookieSelectors = [
-      // Didomi 관련
-      '[id="didomi-notice"]',
-      '[class*="didomi"]',
-      '#didomi-popup',
-      '#didomi-banner',
-      
-      // 일반적인 쿠키 관련
-      '[id*="cookie"]',
-      '[class*="cookie"]',
-      '[data-testid*="cookie"]',
-      '[aria-label*="cookie"]',
-      
-      // Consent 관련
-      '[id*="consent"]',
-      '[class*="consent"]',
-      '[data-testid*="consent"]',
-      
-      // GDPR 관련
-      '[id*="gdpr"]',
-      '[class*="gdpr"]',
-      
-      // Banner/Modal/Popup 관련
-      '[class*="banner"]',
-      '[class*="popup"]',
-      '[class*="modal"]',
-      '[class*="overlay"]',
-      '[role="dialog"]',
-      '[role="banner"]',
-      
-      // 특정 텍스트가 포함된 요소들
-      'div:has-text("cookie")',
-      'div:has-text("consent")',
-      'div:has-text("privacy")',
-      'div:has-text("accept")'
-    ];
-
-    // 먼저 모든 쿠키 관련 요소 제거
-    for (const selector of cookieSelectors) {
-      try {
-        await page.waitForTimeout(500); // 팝업 로드 대기
-        const elements = await page.$$(selector);
-        for (const element of elements) {
-          try {
-            const isVisible = await element.isVisible();
-            const boundingBox = await element.boundingBox();
-            if (isVisible || boundingBox) {
-              await element.evaluate((el) => {
-                el.style.display = 'none !important';
-                el.style.visibility = 'hidden !important';
-                el.style.opacity = '0 !important';
-                el.remove();
-              });
-            }
-          } catch (e) {
-            // 개별 요소 처리 실패 무시
-          }
-        }
-      } catch (error) {
-        // selector 처리 실패 무시
-      }
-    }
-
-    // Accept/동의 버튼들 클릭 시도
-    const acceptSelectors = [
-      '#didomi-notice-agree-button',
-      '#didomi-notice-agree-to-all',
-      '.didomi-continue-without-agreeing',
-      'button:has-text("Accept")',
-      'button:has-text("Accept All")',
-      'button:has-text("동의")',
-      'button:has-text("모두 동의")',
-      'button:has-text("OK")',
-      'button:has-text("Got it")',
-      'button:has-text("I understand")',
-      '[class*="accept"]',
-      '[id*="accept"]',
-      '[data-testid*="accept"]'
-    ];
-
-    for (const selector of acceptSelectors) {
-      try {
-        const button = await page.$(selector);
-        if (button) {
-          const isVisible = await button.isVisible();
-          if (isVisible) {
-            await button.click({ force: true });
-            await page.waitForTimeout(1000);
-            console.log(`Clicked cookie accept button: ${selector}`);
-            break;
-          }
-        }
-      } catch (error) {
-        // 버튼 클릭 실패 무시
-      }
-    }
-
-    // CSS로 강제 숨김 처리
-    await page.addStyleTag({
-      content: `
-        [id*="didomi"],
-        [class*="didomi"],
-        [id*="cookie"],
-        [class*="cookie"],
-        [id*="consent"],
-        [class*="consent"],
-        [id*="gdpr"],
-        [class*="gdpr"] {
-          display: none !important;
-          visibility: hidden !important;
-          opacity: 0 !important;
-          height: 0 !important;
-          width: 0 !important;
-          z-index: -9999 !important;
-        }
-      `
+  private async fastUrlDiscovery(
+    browser: Browser,
+    startUrl: string,
+    maxUrls: number
+  ): Promise<Set<string>> {
+    const context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (compatible; WebCrawler/1.0)',
+      viewport: { width: 1280, height: 800 }
     });
 
-    // 추가 대기 시간으로 팝업 완전 제거 확인
-    await page.waitForTimeout(2000);
+    const page = await context.newPage();
+    const discoveredUrls = new Set<string>([startUrl]);
+    const baseUrl = new URL(startUrl).origin;
+    const urlQueue = [startUrl];
+    const processed = new Set<string>();
+
+    try {
+      while (urlQueue.length > 0 && discoveredUrls.size < maxUrls) {
+        const currentUrl = urlQueue.shift()!;
+        if (processed.has(currentUrl)) continue;
+        processed.add(currentUrl);
+
+        try {
+          await page.goto(currentUrl, { 
+            waitUntil: 'domcontentloaded',
+            timeout: 10000 
+          });
+
+          // Quick wait for dynamic content
+          await page.waitForTimeout(500);
+
+          // Extract all links at once
+          const links = await page.evaluate((baseUrl) => {
+            const urls = new Set<string>();
+            
+            // All anchor tags
+            document.querySelectorAll('a[href]').forEach(a => {
+              try {
+                const href = (a as HTMLAnchorElement).href;
+                const url = new URL(href);
+                if (url.origin === baseUrl && !href.includes('#')) {
+                  urls.add(href);
+                }
+              } catch {}
+            });
+
+            // Look for common navigation patterns
+            document.querySelectorAll('[data-href], [data-url], [data-link]').forEach(el => {
+              const url = el.getAttribute('data-href') || 
+                         el.getAttribute('data-url') || 
+                         el.getAttribute('data-link');
+              if (url) {
+                try {
+                  const fullUrl = new URL(url, baseUrl);
+                  if (fullUrl.origin === baseUrl) {
+                    urls.add(fullUrl.href);
+                  }
+                } catch {}
+              }
+            });
+
+            return Array.from(urls);
+          }, baseUrl);
+
+          // Add discovered links
+          for (const link of links) {
+            if (!discoveredUrls.has(link) && discoveredUrls.size < maxUrls) {
+              discoveredUrls.add(link);
+              urlQueue.push(link);
+            }
+          }
+
+        } catch (error) {
+          this.logger.warn(`Failed to discover URLs from ${currentUrl}`);
+        }
+      }
+    } finally {
+      await context.close();
+    }
+
+    this.logger.log(`📊 Discovered ${discoveredUrls.size} URLs`);
+    return discoveredUrls;
   }
 
-  private async crawlSinglePage(page: Page, url: string, outputDir: string): Promise<CrawlResult> {
+  private async parallelCrawl(
+    browser: Browser,
+    urls: string[],
+    outputDir: string,
+    analysisId: string
+  ): Promise<CrawlResult[]> {
+    const results: CrawlResult[] = [];
+    const limit = pLimit(5); // 5 concurrent pages
+    
+    // Create contexts for parallel crawling
+    const contexts = await Promise.all(
+      Array(Math.min(5, urls.length)).fill(0).map(() => 
+        browser.newContext({
+          userAgent: 'Mozilla/5.0 (compatible; WebCrawler/1.0)',
+          viewport: { width: 1280, height: 800 }
+        })
+      )
+    );
+
+    let contextIndex = 0;
+
+    const crawlTasks = urls.map((url, index) => 
+      limit(async () => {
+        const context = contexts[contextIndex % contexts.length];
+        contextIndex++;
+        
+        const page = await context.newPage();
+        
+        try {
+          const result = await this.fastCrawlPage(page, url, outputDir, index, urls.length, analysisId);
+          results.push(result);
+          return result;
+        } catch (error) {
+          this.logger.error(`Failed to crawl ${url}:`, error);
+          return null;
+        } finally {
+          await page.close();
+        }
+      })
+    );
+
+    await Promise.all(crawlTasks);
+
+    // Cleanup contexts
+    await Promise.all(contexts.map(ctx => ctx.close()));
+
+    return results.filter(r => r !== null) as CrawlResult[];
+  }
+
+  private async fastCrawlPage(
+    page: Page, 
+    url: string, 
+    outputDir: string,
+    index: number,
+    total: number,
+    analysisId: string
+  ): Promise<CrawlResult> {
     const timestamp = new Date().toISOString();
-    const pageId = `page_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const pageId = `page_${Date.now()}_${index}`;
 
-    console.log(`🚀 페이지 로딩 시작: ${url}`);
-    
-    // Enable console logging from the page
-    page.on('console', msg => {
-      console.log(`[PAGE ${msg.type().toUpperCase()}] ${msg.text()}`);
-    });
-    
-    // Navigate to the page first!
+    this.logger.log(`🔍 Crawling (${index + 1}/${total}): ${url}`);
+
+    // Navigate with minimal wait
     await page.goto(url, { 
-      waitUntil: 'domcontentloaded', 
-      timeout: 30000 
+      waitUntil: 'domcontentloaded',
+      timeout: 15000 
     });
 
-    console.log(`📄 페이지 로드 완료, SPA 렌더링 대기 중...`);
+    // Quick wait for initial render
+    await page.waitForTimeout(1000);
 
-    // Wait for the page to be fully interactive
-    await page.waitForLoadState('networkidle').catch(() => {
-      console.log('⚠️ 네트워크 idle 대기 실패, DOM 로드로 대체');
-      return page.waitForLoadState('domcontentloaded');
-    });
+    // Remove cookie popups in parallel with content extraction
+    const cookiePromise = this.quickRemoveCookies(page);
     
-    // Give SPAs extra time to render - curated.media needs more time
-    console.log(`⏳ SPA 렌더링을 위해 5초 대기...`);
-    await page.waitForTimeout(5000);
+    // Extract data
+    const [pageData, _] = await Promise.all([
+      page.evaluate(() => {
+        const currentOrigin = location.origin;
 
-    // Remove cookie popups only for full analysis (프리뷰에서는 생략)
-    const isPreviewRun = path.basename(outputDir).startsWith('preview_');
-    if (!isPreviewRun) {
-      console.log(`🍪 쿠키 팝업 및 오버레이 제거 중...`);
-      await this.removeCookiePopups(page);
-      await page.waitForTimeout(1000);
-    }
+        // Extract links
+        const links = Array.from(new Set(
+          Array.from(document.querySelectorAll('a[href]'))
+            .map(a => (a as HTMLAnchorElement).href)
+            .filter(href => {
+              try {
+                const url = new URL(href);
+                return url.origin === currentOrigin && !href.includes('#');
+              } catch {
+                return false;
+              }
+            })
+        ));
 
-    // Try to trigger any lazy-loaded content
-    console.log(`📜 스크롤하여 지연 로딩 컨텐츠 트리거...`);
-    await page.evaluate(() => {
-      // Scroll to trigger lazy loading
-      window.scrollTo(0, document.body.scrollHeight);
-      window.scrollTo(0, 0);
-    });
-    await page.waitForTimeout(2000);
+        // Extract other data
+        const images = Array.from(document.querySelectorAll('img[src]'))
+          .map(img => (img as HTMLImageElement).src)
+          .filter(src => src && !src.startsWith('data:'))
+          .slice(0, 10); // Limit images
 
-    // 쿠키 동의 버튼 처리 (팝업이 스크린샷에 보이지 않도록)
-    await this.clickCookieAccept(page);
+        const headings = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6'))
+          .slice(0, 20) // Limit headings
+          .map(h => ({ 
+            level: h.tagName.toLowerCase(), 
+            text: h.textContent?.trim() || '' 
+          }));
 
-    // Screenshot
+        const forms = document.querySelectorAll('form').length;
+        const buttons = Array.from(document.querySelectorAll('button'))
+          .slice(0, 10)
+          .map(btn => btn.textContent?.trim() || '')
+          .filter(t => t);
+
+        // Get text content (limited)
+        const textContent = document.body?.innerText?.slice(0, 5000) || '';
+
+        return {
+          title: document.title || '',
+          links,
+          images,
+          headings,
+          forms,
+          buttons,
+          textContent,
+          wordCount: textContent.split(/\s+/).length
+        };
+      }),
+      cookiePromise
+    ]);
+
+    // Take screenshot
     const screenshotFilename = `${pageId}.png`;
-    const screenshotsDir = path.join(outputDir, 'screenshots');
-    if (!fs.existsSync(screenshotsDir)) {
-      fs.mkdirSync(screenshotsDir, { recursive: true });
-    }
-    const screenshotPath = path.join(screenshotsDir, screenshotFilename);
+    const screenshotPath = path.join(outputDir, 'screenshots', screenshotFilename);
+    
     await page.screenshot({
       path: screenshotPath,
-      fullPage: true,
+      fullPage: false, // Faster with viewport only
       type: 'png'
     });
 
-    // HTML content
-    const htmlContent = await page.content();
+    // Save HTML (optional - can skip for speed)
     const htmlFilename = `${pageId}.html`;
-    const htmlDir = path.join(outputDir, 'html');
-    if (!fs.existsSync(htmlDir)) {
-      fs.mkdirSync(htmlDir, { recursive: true });
-    }
-    const htmlPath = path.join(htmlDir, htmlFilename);
+    const htmlPath = path.join(outputDir, 'html', htmlFilename);
+    const htmlContent = await page.content();
     await fs.promises.writeFile(htmlPath, htmlContent);
 
-    // Extract all possible navigation targets
-    console.log(`🔍 링크 추출 시작: ${url}`);
+    // Determine page type
+    let pageType = '일반페이지';
+    const pathname = new URL(url).pathname.toLowerCase();
+    const titleLower = pageData.title.toLowerCase();
     
-    const navigationData = await page.evaluate(() => {
-      const currentOrigin = location.origin;
-
-      // 1) 모든 a[href] 절대 URL 모으기
-      const rawLinks = Array.from(document.querySelectorAll('a[href]'))
-        .map(a => (a as HTMLAnchorElement).href.trim())
-        .filter(h => h &&
-                    !h.startsWith('javascript:') &&
-                    !h.startsWith('mailto:') &&
-                    !h.startsWith('tel:'));
-
-      // 2) 같은 Origin 만 필터 & 중복 제거
-      const links = Array.from(new Set(
-        rawLinks.filter(h => {
-          try { return new URL(h).origin === currentOrigin; } catch { return false; }
-        })
-      ));
-
-      // 기본 페이지 메타 데이터
-      const images = Array.from(document.querySelectorAll('img[src]'))
-        .map(img => (img as HTMLImageElement).src)
-        .filter(src => src && !src.startsWith('data:'));
-
-      const headings = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6'))
-        .map(h => ({ level: h.tagName.toLowerCase(), text: h.textContent?.trim() || '' }))
-        .filter(h => h.text);
-
-      const forms = document.querySelectorAll('form').length;
-      const buttonTexts = Array.from(document.querySelectorAll('button,input[type="button"],input[type="submit"]'))
-        .map(btn => btn.textContent?.trim() || btn.getAttribute('value') || '')
-        .filter(t => t);
-
-      return {
-        title: document.title || '',
-        links,
-        allLinks: rawLinks,
-        images,
-        headings,
-        forms,
-        textContent: document.body?.innerText || '',
-        buttons: buttonTexts,
-        debugInfo: [] as any[]
-      };
-    });
-
-    // Log debug information
-    console.log(`\n🔍 Link Extraction Debug for ${url}:`);
-    console.log(`Found ${navigationData.links.length} valid links`);
-    console.log(`Total links discovered: ${navigationData.allLinks ? navigationData.allLinks.length : 0}`);
-    
-    // Temporary: Add debug info to textContent for inspection
-    let debugText = `\n\n=== DEBUG INFO ===\n`;
-    debugText += `Total links found: ${navigationData.links.length}\n`;
-    debugText += `All links discovered: ${navigationData.allLinks ? navigationData.allLinks.length : 0}\n`;
-    debugText += `Debug entries: ${navigationData.debugInfo ? navigationData.debugInfo.length : 0}\n`;
-    
-    if (navigationData.allLinks) {
-      debugText += `\nAll discovered links:\n`;
-      navigationData.allLinks.slice(0, 10).forEach(link => debugText += `  - ${link}\n`);
-      if (navigationData.allLinks.length > 10) {
-        debugText += `  ... and ${navigationData.allLinks.length - 10} more\n`;
-      }
-    }
-    
-    if (navigationData.debugInfo) {
-      const accepted = navigationData.debugInfo.filter(d => d.accepted);
-      const rejected = navigationData.debugInfo.filter(d => !d.accepted);
-      
-      debugText += `\nAccepted: ${accepted.length} links\n`;
-      accepted.slice(0, 5).forEach(d => debugText += `  - ${d.url} (${d.source})\n`);
-      
-      debugText += `\nRejected: ${rejected.length} links\n`;
-      const rejectionReasons = rejected.reduce((acc, d) => {
-        acc[d.rejected] = (acc[d.rejected] || 0) + 1;
-        return acc;
-      }, {} as Record<string, number>);
-      
-      Object.entries(rejectionReasons).forEach(([reason, count]) => {
-        debugText += `  - ${reason}: ${count} links\n`;
-      });
-      
-      // Add first few rejected links for inspection
-      debugText += `\nFirst few rejected:\n`;
-      rejected.slice(0, 5).forEach(d => debugText += `  - ${d.url} (${d.rejected}, ${d.source})\n`);
-    }
-    
-    // Append debug info to textContent temporarily
-    navigationData.textContent += debugText;
-    
-    if (navigationData.debugInfo) {
-      const accepted = navigationData.debugInfo.filter(d => d.accepted);
-      const rejected = navigationData.debugInfo.filter(d => !d.accepted);
-      
-      console.log(`✅ Accepted: ${accepted.length} links`);
-      accepted.slice(0, 5).forEach(d => console.log(`  - ${d.url} (${d.source})`));
-      
-      console.log(`❌ Rejected: ${rejected.length} links`);
-      const rejectionReasons = rejected.reduce((acc, d) => {
-        acc[d.rejected] = (acc[d.rejected] || 0) + 1;
-        return acc;
-      }, {} as Record<string, number>);
-      
-      Object.entries(rejectionReasons).forEach(([reason, count]) => {
-        console.log(`  - ${reason}: ${count} links`);
-      });
+    if (pathname === '/' || pathname === '/home' || titleLower.includes('home')) {
+      pageType = '홈페이지';
+    } else if (pathname.includes('about') || titleLower.includes('about')) {
+      pageType = '소개페이지';
+    } else if (pathname.includes('contact') || titleLower.includes('contact')) {
+      pageType = '연락처';
+    } else if (pathname.includes('product') || titleLower.includes('product')) {
+      pageType = '제품페이지';
+    } else if (pathname.includes('service') || titleLower.includes('service')) {
+      pageType = '서비스페이지';
     }
 
-         // Page type classification
-     let pageType = '일반페이지';
-     const pathname = new URL(url).pathname.toLowerCase();
-     const titleLower = navigationData.title.toLowerCase();
-     
-     if (pathname === '/' || pathname === '/home' || titleLower.includes('home')) {
-       pageType = '홈페이지';
-     } else if (pathname.includes('about') || titleLower.includes('about')) {
-       pageType = '소개페이지';
-     } else if (pathname.includes('contact') || titleLower.includes('contact')) {
-       pageType = '연락처';
-     } else if (pathname.includes('product') || titleLower.includes('product')) {
-       pageType = '제품페이지';
-     } else if (pathname.includes('service') || titleLower.includes('service')) {
-       pageType = '서비스페이지';
-     } else if (pathname.includes('dashboard') || titleLower.includes('dashboard')) {
-       pageType = '대시보드';
-     }
+    // Update progress
+    await this.prisma.analysis.update({
+      where: { id: analysisId },
+      data: { 
+        progress: Math.round(((index + 1) / total) * 100)
+      },
+    }).catch(() => {}); // Ignore errors
 
-    const isPreview = path.basename(outputDir).startsWith('preview_');
-    const screenshotUrl = isPreview
-      ? `/temp/${path.basename(outputDir)}/screenshots/${screenshotFilename}`
-      : `/uploads/${path.basename(outputDir)}/screenshots/${screenshotFilename}`;
-    const htmlUrl = isPreview
-      ? `/temp/${path.basename(outputDir)}/html/${htmlFilename}`
-      : `/uploads/${path.basename(outputDir)}/html/${htmlFilename}`;
-
-    // Add debugging info
-    console.log(`📊 Navigation data:`, {
-      title: navigationData.title,
-      linksFound: navigationData.links.length,
-      debugEntries: navigationData.debugInfo?.length || 0
-    });
-    
-    const result: CrawlResult = {
+    return {
       id: pageId,
       url,
-      title: `${navigationData.title} [LINKS: ${navigationData.links.length}]`,
+      title: pageData.title,
       pageType,
-      links: navigationData.links,
-      images: navigationData.images,
-      headings: navigationData.headings,
-      forms: navigationData.forms,
-      buttons: navigationData.buttons,
-      textContent: navigationData.textContent + `\n\n=== DEBUG ===\nLinks found: ${navigationData.links.length}\nDebug entries: ${navigationData.debugInfo?.length || 0}`,
-      screenshotPath: screenshotUrl,
-      htmlPath: htmlUrl,
+      links: pageData.links,
+      images: pageData.images,
+      headings: pageData.headings,
+      forms: pageData.forms,
+      buttons: pageData.buttons,
+      textContent: pageData.textContent,
+      screenshotPath: `/uploads/${path.basename(outputDir)}/screenshots/${screenshotFilename}`,
+      htmlPath: `/uploads/${path.basename(outputDir)}/html/${htmlFilename}`,
       timestamp,
       metadata: {
-        wordCount: navigationData.textContent.split(/\s+/).length,
-        imageCount: navigationData.images.length,
-        linkCount: navigationData.links.length
+        wordCount: pageData.wordCount,
+        imageCount: pageData.images.length,
+        linkCount: pageData.links.length
       }
     };
-
-    return result;
   }
 
-  private async extractLinks(page: Page): Promise<string[]> {
-    const base = new URL(page.url()).origin;
+  private async quickRemoveCookies(page: Page): Promise<void> {
+    try {
+      // Inject CSS to hide common cookie elements
+      await page.addStyleTag({
+        content: `
+          [class*="cookie"], [id*="cookie"], [class*="consent"], 
+          [id*="consent"], [class*="gdpr"], [id*="gdpr"],
+          [class*="banner"], [id*="banner"], .modal, .popup {
+            display: none !important;
+            visibility: hidden !important;
+          }
+        `
+      });
 
-    // 1) 메뉴(사이드바)가 렌더될 때까지 기다리기
-    await page.waitForSelector('nav, .sidebar, [role="menu"]', { timeout: 5000 }).catch(() => {});
+      // Try to click accept buttons
+      const acceptSelectors = [
+        'button:has-text("Accept")',
+        'button:has-text("OK")',
+        'button:has-text("Agree")',
+        '[id*="accept"]',
+        '[class*="accept"]'
+      ];
 
-    // 2) 모든 <a> 태그의 절대 URL
-    const anchors = await page.$$eval('a[href]', els =>
-      els
-        .map(a => (a as HTMLAnchorElement).href)
-        .filter(href => href.startsWith(window.location.origin) &&
-                        !/(javascript:|mailto:|tel:)/.test(href) &&
-                        !/\.(css|js|png|jpg|jpeg|gif|svg|ico|pdf|zip|mp4|mp3)([?#]|$)/i.test(href))
-    );
-
-    // 3) onclick 속성으로 네비게이션 하는 버튼
-    const btns = await page.$$eval('button[onclick]', els =>
-      els
-        .map(b => {
-          const m = b.getAttribute('onclick')?.match(/location\.href\s*=\s*['"]([^'"]+)['"]/);
-          return m ? new URL(m[1], window.location.href).href : null;
-        })
-        .filter((u): u is string => !!u && u.startsWith(window.location.origin))
-    );
-
-    // 4) data-href / data-url 속성
-    const dataLinks = await page.$$eval('[data-href],[data-url]', els =>
-      els
-        .map(el => el.getAttribute('data-href') || el.getAttribute('data-url'))
-        .map(url => url ? new URL(url, window.location.href).href : null)
-        .filter((u): u is string => !!u && u.startsWith(window.location.origin))
-    );
-
-    // 5) 실제 클릭으로 라우팅되는 링크 (SPA)
-    const clickItems = await page.$$('nav button, nav li, [role="menuitem"]');
-    const clickLinks: string[] = [];
-    for (const item of clickItems) {
-      try {
-        const before = page.url();
-        await item.click();
-        await page.waitForLoadState('networkidle');
-        const after = page.url();
-        if (after !== before && after.startsWith(base)) {
-          clickLinks.push(after);
-        }
-        // 뒤로 돌아가기
-        await page.goBack({ waitUntil: 'networkidle' });
-      } catch {
-        // 클릭 실패해도 무시
-      } finally {
-        await page.waitForTimeout(500);
+      for (const selector of acceptSelectors) {
+        await page.click(selector, { timeout: 1000 }).catch(() => {});
       }
+    } catch {
+      // Ignore errors
     }
-
-    // 6) 모두 합쳐서 중복 제거
-    const all = [...anchors, ...btns, ...dataLinks, ...clickLinks];
-    return Array.from(new Set(all));
   }
 
+  // 무료 미리보기 - 더 빠르게!
+  async getPreviewAnalysis(url: string): Promise<AnalysisResult> {
+    this.logger.log(`Starting fast preview for: ${url}`);
+    
+    const browser = await chromium.launch({ 
+      headless: true,
+      args: ['--no-sandbox', '--disable-dev-shm-usage']
+    });
+
+    try {
+      new URL(url);
+      
+      const outputDir = path.join(process.cwd(), 'temp', `preview_${Date.now()}`);
+      await fs.promises.mkdir(outputDir, { recursive: true });
+      
+      // Fast discovery
+      const urls = await this.fastUrlDiscovery(browser, url, 30);
+      
+      // Parallel crawl
+      const results = await this.parallelCrawl(
+        browser,
+        Array.from(urls).slice(0, 30),
+        outputDir,
+        'preview'
+      );
+      
+      // Generate network data
+      const sitemap: Record<string, string[]> = {};
+      results.forEach(result => {
+        sitemap[result.url] = result.links.filter(link => 
+          urls.has(link) && link !== result.url
+        );
+      });
+      
+      const networkData = this.generateNetworkData(results, sitemap);
+      
+      return {
+        results,
+        networkData,
+        totalPages: results.length,
+        isPreview: true,
+        previewLimit: 30,
+        message: `미리보기로 ${results.length}개 페이지를 분석했습니다. 전체 분석을 원하시면 로그인해주세요.`
+      };
+      
+    } catch (error) {
+      this.logger.error(`Preview failed:`, error);
+      throw error;
+    } finally {
+      await browser.close();
+    }
+  }
+
+  // 기존 헬퍼 메서드들은 그대로 유지
   private generateNetworkData(results: CrawlResult[], sitemap: Record<string, string[]>): NetworkData {
     const nodes: NetworkNode[] = [];
     const edges: NetworkEdge[] = [];
     const processedUrls = new Set<string>();
     
-    results.forEach((result, index) => {
+    results.forEach((result) => {
       if (!processedUrls.has(result.url)) {
         processedUrls.add(result.url);
         
-        // Determine node color based on page type
-        let color = '#6366f1'; // Default purple
+        let color = '#6366f1';
         switch (result.pageType) {
           case '홈페이지': color = '#ef4444'; break;
           case '소개페이지': color = '#10b981'; break;
           case '연락처': color = '#f59e0b'; break;
           case '제품페이지': color = '#8b5cf6'; break;
           case '서비스페이지': color = '#06b6d4'; break;
-          case '대시보드': color = '#ec4899'; break;
         }
         
         nodes.push({
           id: result.id,
-          label: result.title.substring(0, 20) + (result.title.length > 20 ? '...' : ''),
+          label: result.title.substring(0, 30) + (result.title.length > 30 ? '...' : ''),
           color,
           type: result.pageType,
           url: result.url,
@@ -725,27 +585,23 @@ export class CrawlerService {
       }
     });
     
-    // Generate edges from sitemap
-    Object.entries(sitemap).forEach(([parentUrl, childUrls]) => {
-      const parentResult = results.find(r => r.url === parentUrl);
-      if (parentResult) {
-        childUrls.forEach(childUrl => {
-          const childResult = results.find(r => r.url === childUrl);
-          if (childResult) {
-            edges.push({
-              from: parentResult.id,
-              to: childResult.id
-            });
-          }
-        });
-      }
+    // Create edges based on links
+    results.forEach(result => {
+      result.links.forEach(link => {
+        const targetResult = results.find(r => r.url === link);
+        if (targetResult) {
+          edges.push({
+            from: result.id,
+            to: targetResult.id
+          });
+        }
+      });
     });
     
     return { nodes, edges };
   }
 
   private generateVisualizationHtml(networkData: NetworkData, results: CrawlResult[]): string {
-    // 기존 시각화 HTML 생성 코드 유지
     return `
 <!DOCTYPE html>
 <html>
@@ -756,7 +612,6 @@ export class CrawlerService {
         body { font-family: Arial, sans-serif; margin: 0; padding: 20px; }
         #network { height: 600px; border: 1px solid #ccc; }
         .info-panel { margin-top: 20px; padding: 15px; background: #f5f5f5; border-radius: 8px; }
-        .page-info { margin: 10px 0; padding: 10px; background: white; border-radius: 4px; }
     </style>
 </head>
 <body>
@@ -794,30 +649,8 @@ export class CrawlerService {
 </html>`;
   }
 
-  // 유틸리티 함수들
-  private sanitizeFilename(url: string): string {
-    return url.replace(/[^0-9a-zA-Z]+/g, '_').slice(0, 200);
-  }
-
-  private sleep(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
-
-  private randomDelay(min: number = 1000, max: number = 3000): number {
-    return Math.random() * (max - min) + min;
-  }
-
-  private isSameDomain(url: string, baseUrl: string): boolean {
-    try {
-      const urlObj = new URL(url);
-      const baseUrlObj = new URL(baseUrl);
-      return urlObj.hostname === baseUrlObj.hostname;
-    } catch {
-      return false;
-    }
-  }
-
-  // 사용자별 분석 조회 (Free 유저는 5개만)
+  // 나머지 메서드들 (getUserAnalyses, getAnalysis, downloadFile 등)은 그대로 유지...
+  
   async getUserAnalyses(userId: number, limit?: number) {
     const user = await this.prisma.user.findUnique({
       where: { id: userId }
@@ -842,7 +675,6 @@ export class CrawlerService {
     });
   }
 
-  // 분석 상세 조회
   async getAnalysis(analysisId: string, userId: number) {
     const analysis = await this.prisma.analysis.findFirst({
       where: { 
@@ -861,158 +693,6 @@ export class CrawlerService {
     };
   }
 
-  // 무료 미리보기 (로그인 없이 5개 페이지만)
-  async getPreviewAnalysis(url: string): Promise<AnalysisResult> {
-    this.logger.log(`Starting preview analysis for: ${url}`);
-    
-    try {
-      // Validate URL
-      new URL(url);
-      
-      // Perform DFS crawl with preview limits
-      const { results, sitemap } = await this.performDFSCrawl(url, 2, 5); // depth=2, max=5 pages for preview
-      
-      // Generate network data
-      const networkData = this.generateNetworkData(results, sitemap);
-      
-      return {
-        results,
-        networkData,
-        totalPages: results.length,
-        isPreview: true,
-        previewLimit: 5,
-        message: `미리보기로 ${results.length}개 페이지를 분석했습니다. 전체 분석을 원하시면 로그인해주세요.`
-      };
-      
-    } catch (error) {
-      this.logger.error(`Preview analysis failed for ${url}:`, error);
-      throw error;
-    }
-  }
-
-  private async performDFSCrawl(
-    startUrl: string, 
-    maxDepth: number = 3, 
-    maxPages: number = 5
-  ): Promise<{ results: CrawlResult[], sitemap: Record<string, string[]> }> {
-    
-    // Create output directory
-    const timestamp = Date.now();
-    const outputDir = path.join(process.cwd(), 'temp', `preview_${timestamp}`);
-    if (!fs.existsSync(outputDir)) {
-      fs.mkdirSync(outputDir, { recursive: true });
-    }
-    
-    let browser: Browser | null = null;
-    let context: BrowserContext | null = null;
-    
-    try {
-      // Launch browser
-      browser = await chromium.launch({ 
-        headless: true,
-        args: ['--no-sandbox', '--disable-dev-shm-usage']
-      });
-      
-      context = await browser.newContext({
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-        viewport: { width: 1400, height: 900 }
-      });
-      
-      const page = await context.newPage();
-      
-      const visited = new Set<string>();
-      const sitemap: Record<string, string[]> = {};
-      const results: CrawlResult[] = [];
-      
-      // DFS crawling function
-      const dfs = async (url: string, depth: number): Promise<void> => {
-        if (depth > maxDepth || visited.has(url) || results.length >= maxPages) {
-          this.logger.log(`⏭️  Skipping ${url} - depth:${depth}/${maxDepth}, visited:${visited.has(url)}, results:${results.length}/${maxPages}`);
-          return;
-        }
-        
-        this.logger.log(`🔍 [DEPTH ${depth}] Starting crawl: ${url}`);
-        visited.add(url);
-        
-        try {
-          // Navigate to the page
-          await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-          await page.waitForTimeout(3000);
-          
-          // SPA 네비게이션 탐지 (첫 번째 페이지에서만)
-          if (depth === 0) {
-            console.log('🔍 Detecting SPA navigation patterns...');
-            const spaRoutes = await this.detectSPANavigation(page, new URL(startUrl).origin);
-            console.log(`🎯 Found ${spaRoutes.length} potential SPA routes`);
-            
-            // SPA 라우트를 방문 목록에 추가
-            for (const route of spaRoutes) {
-              if (!visited.has(route)) {
-                visited.add(route);
-                console.log(`➕ Added SPA route: ${route}`);
-              }
-            }
-          }
-          
-          const result = await this.crawlSinglePage(page, url, outputDir);
-          results.push(result);
-          
-          this.logger.log(`✅ [DEPTH ${depth}] Crawled successfully: ${url} (found ${result.links.length} links)`);
-          
-          // Filter same-domain links
-          const childLinks = result.links.filter(link => this.isSameDomain(link, startUrl));
-          sitemap[url] = childLinks;
-          
-          this.logger.log(`🔗 [DEPTH ${depth}] Same-domain child links: ${childLinks.length}`);
-          childLinks.forEach((link, index) => {
-            this.logger.log(`   ${index + 1}. ${link}`);
-          });
-          
-          // Recursively crawl child links
-          for (const childUrl of childLinks) {
-            if (results.length >= maxPages) {
-              this.logger.log(`🛑 Reached max pages limit (${maxPages})`);
-              break;
-            }
-            
-            if (!visited.has(childUrl)) {
-              this.logger.log(`⏳ [DEPTH ${depth}] Preparing to crawl child: ${childUrl}`);
-              
-              // Random delay between requests
-              const delay = this.randomDelay(1000, 3000);
-              this.logger.log(`⏰ Waiting ${Math.round(delay)}ms before next crawl...`);
-              await this.sleep(delay);
-              
-              await dfs(childUrl, depth + 1);
-            } else {
-              this.logger.log(`⏭️  Already visited: ${childUrl}`);
-            }
-          }
-          
-        } catch (error) {
-          this.logger.warn(`❌ [DEPTH ${depth}] Failed to crawl ${url}: ${error.message}`);
-          sitemap[url] = [];
-        }
-      };
-      
-      // Start DFS from root URL
-      await dfs(startUrl, 0);
-      
-      // Save sitemap
-      const sitemapPath = path.join(outputDir, 'sitemap.json');
-      fs.writeFileSync(sitemapPath, JSON.stringify(sitemap, null, 2));
-      
-      this.logger.log(`Crawl finished - ${results.length} pages crawled`);
-      
-      return { results, sitemap };
-      
-    } finally {
-      if (context) await context.close();
-      if (browser) await browser.close();
-    }
-  }
-
-  // 파일 다운로드 (로그인 필요)
   async downloadFile(analysisId: string, userId: number, fileType: 'png' | 'html', pageId: string) {
     const analysis = await this.prisma.analysis.findFirst({
       where: { 
@@ -1049,234 +729,4 @@ export class CrawlerService {
       contentType: fileType === 'png' ? 'image/png' : 'text/html'
     };
   }
-
-  // Add SPA detection method
-  private async detectSPANavigation(page: Page, baseUrl: string): Promise<string[]> {
-    const discoveredUrls = new Set<string>();
-    
-    console.log('🔍 Detecting SPA navigation patterns...');
-    
-    // Method 1: Intercept navigation requests
-    page.on('request', request => {
-      const url = request.url();
-      const resourceType = request.resourceType();
-      
-      // Look for API calls that might indicate routes
-      if ((resourceType === 'xhr' || resourceType === 'fetch') && url.startsWith(baseUrl)) {
-        console.log(`🌐 Detected API call: ${url}`);
-        
-        // Extract potential routes from API paths
-        try {
-          const urlObj = new URL(url);
-          const pathSegments = urlObj.pathname.split('/').filter(s => s);
-          
-          // Common patterns: /api/pages/*, /api/*/list, etc.
-          if (pathSegments.includes('pages') || pathSegments.includes('routes')) {
-            discoveredUrls.add(url);
-          }
-        } catch (e) {
-          // Invalid URL
-        }
-      }
-    });
-    
-    // Method 2: Monitor for client-side route changes
-    await page.evaluate(() => {
-      // Intercept History API
-      const originalPushState = history.pushState;
-      const originalReplaceState = history.replaceState;
-      
-      history.pushState = function(...args) {
-        console.log('🔀 pushState:', args[2]);
-        window.postMessage({ type: 'navigation', url: args[2] }, '*');
-        return originalPushState.apply(history, args);
-      };
-      
-      history.replaceState = function(...args) {
-        console.log('🔀 replaceState:', args[2]);
-        window.postMessage({ type: 'navigation', url: args[2] }, '*');
-        return originalReplaceState.apply(history, args);
-      };
-    });
-    
-    // Listen for navigation messages
-    await page.exposeFunction('onNavigation', (url: string) => {
-      if (url && url.startsWith('/')) {
-        discoveredUrls.add(new URL(url, baseUrl).href);
-      }
-    });
-    
-    await page.evaluate(() => {
-      window.addEventListener('message', (e) => {
-        if (e.data.type === 'navigation' && e.data.url) {
-          (window as any).onNavigation(e.data.url);
-        }
-      });
-    });
-    
-    // Method 3: Extract routes from JavaScript
-    const jsRoutes = await page.evaluate(() => {
-      const routes = new Set<string>();
-      
-      // Look for Next.js routes
-      if ((window as any).__NEXT_DATA__) {
-        const nextData = (window as any).__NEXT_DATA__;
-        console.log('🔷 Found Next.js data:', nextData);
-        
-        // Extract page paths
-        if (nextData.page) routes.add(nextData.page);
-        if (nextData.props?.pageProps?.href) routes.add(nextData.props.pageProps.href);
-        
-        // Look for route manifest
-        if (nextData.runtimeConfig?.routes) {
-          Object.values(nextData.runtimeConfig.routes).forEach((route: any) => {
-            if (typeof route === 'string') routes.add(route);
-          });
-        }
-      }
-      
-      // Look for React Router
-      if ((window as any).__reactRouterVersion) {
-        console.log('⚛️ Found React Router');
-        
-        // Try to find route configuration
-        const routerElements = document.querySelectorAll('[data-route], [data-path]');
-        routerElements.forEach(el => {
-          const route = el.getAttribute('data-route') || el.getAttribute('data-path');
-          if (route) routes.add(route);
-        });
-      }
-      
-      // Look for Vue Router
-      if ((window as any).$nuxt || (window as any).__VUE__) {
-        console.log('🟢 Found Vue/Nuxt');
-        
-        // Extract routes from Vue Router
-        try {
-          const app = (window as any).__VUE__ || (window as any).$nuxt;
-          if (app.$router && app.$router.options && app.$router.options.routes) {
-            app.$router.options.routes.forEach((route: any) => {
-              if (route.path) routes.add(route.path);
-            });
-          }
-        } catch (e) {
-          console.error('Error extracting Vue routes:', e);
-        }
-      }
-      
-      return Array.from(routes);
-    });
-    
-    jsRoutes.forEach(route => {
-      try {
-        const fullUrl = new URL(route, baseUrl);
-        discoveredUrls.add(fullUrl.href);
-      } catch (e) {
-        // Invalid URL
-      }
-    });
-    
-    // Method 4: Click on navigation elements
-    const navSelectors = [
-      'nav a',
-      'nav button',
-      '[role="navigation"] a',
-      '[role="navigation"] button',
-      '.nav-link',
-      '.nav-item',
-      'a[class*="nav"]',
-      'button[class*="nav"]',
-      '[data-testid*="nav"]',
-      '[aria-label*="navigation"]'
-    ];
-    
-    for (const selector of navSelectors) {
-      const elements = await page.$$(selector);
-      console.log(`🖱️ Found ${elements.length} elements matching ${selector}`);
-      
-      for (const element of elements.slice(0, 5)) { // Limit to prevent too many clicks
-        try {
-          const isVisible = await element.isVisible();
-          if (!isVisible) continue;
-          
-          const beforeUrl = page.url();
-          
-          // Hover first (might trigger dropdowns)
-          await element.hover();
-          await page.waitForTimeout(500);
-          
-          // Try to click
-          await element.click({ timeout: 2000 });
-          await page.waitForTimeout(1000);
-          
-          const afterUrl = page.url();
-          if (afterUrl !== beforeUrl && afterUrl.startsWith(baseUrl)) {
-            discoveredUrls.add(afterUrl);
-            console.log(`✅ Discovered via click: ${afterUrl}`);
-            
-            // Go back
-            await page.goBack({ waitUntil: 'domcontentloaded' });
-          }
-        } catch (e) {
-          // Click failed, continue
-        }
-      }
-    }
-    
-    console.log(`🎯 Found ${discoveredUrls.size} potential SPA routes`);
-    discoveredUrls.forEach((route, i) => console.log(`  ${i + 1}. ${route}`));
-    
-    return Array.from(discoveredUrls);
-  }
-
-  private async clickCookieAccept(page: Page): Promise<void> {
-    const selectors = [
-      // 일반 텍스트
-      'button:has-text("Accept")',
-      'button:has-text("Accept All")',
-      'button:has-text("Agree")',
-      'button:has-text("Agree and Close")',
-      'button:has-text("OK")',
-      'button:has-text("Got it")',
-      'button:has-text("동의")',
-      'button:has-text("모두 동의")',
-      // Didomi 전용
-      '#didomi-notice-agree-button',
-      'button#didomi-notice-agree-button',
-      '[id="didomi-notice-agree-button"]',
-      // 속성 기반
-      '[id*="accept"]',
-      '[class*="accept"]',
-      '[id*="agree"]',
-      '[class*="agree"]'
-    ];
-    for (const selector of selectors) {
-      try {
-        const btn = await page.$(selector);
-        if (btn) {
-          const box = await btn.boundingBox();
-          if (box) {
-            console.log(`✅ 쿠키 동의 버튼 클릭: ${selector}`);
-            await btn.click({ timeout: 3000 }).catch(() => {});
-            await page.waitForTimeout(1500);
-            break;
-          }
-        }
-      } catch {
-        /* ignore */
-      }
-    }
-
-    // 팝업이 여전히 보이면 강제 제거
-    try {
-      const banner = await page.$('#didomi-notice');
-      if (banner) {
-        const visible = await banner.isVisible();
-        if (visible) {
-          console.log('⚠️ 배너가 아직 남아 있어 강제 제거합니다');
-          await banner.evaluate(el => el.remove());
-        }
-      }
-    } catch {/* ignore */}
-  }
-}
+} 
