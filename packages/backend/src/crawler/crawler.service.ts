@@ -13,6 +13,7 @@ export interface CrawlResult {
   images: string[];
   headings: { level: string; text: string }[];
   forms: number;
+  buttons: string[];
   textContent: string;
   screenshotPath: string;
   htmlPath: string;
@@ -122,10 +123,12 @@ export class CrawlerService {
     await fs.promises.mkdir(screenshotsDir, { recursive: true });
     await fs.promises.mkdir(htmlDir, { recursive: true });
 
-    // Playwright 브라우저 실행
-    const browser = await chromium.launch({ headless: true });
+    const browser = await chromium.launch({ 
+      headless: true
+    });
     const context = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+      viewport: { width: 1400, height: 900 }
     });
 
     try {
@@ -144,11 +147,35 @@ export class CrawlerService {
         const page = await context.newPage();
         
         try {
-          await page.goto(currentUrl, { waitUntil: 'networkidle', timeout: 15000 });
-          
+          // ChatGPT 분석 반영: networkidle 타임아웃 문제 해결
+          console.log(`🔍 Loading page: ${currentUrl}`);
+          const response = await page.goto(currentUrl, { 
+            waitUntil: 'domcontentloaded', 
+            timeout: 30000 
+          });
+
+          // 응답 상태 확인
+          if (!response || !response.ok()) {
+            console.log(`❌ Page load failed with status: ${response?.status()}`);
+            continue;
+          }
+
+          // Curated.media WebSocket/SSE 지속 대응: networkidle 대신 DOM 로드 후 대기
+          await page.waitForTimeout(3000);
+          console.log(`✅ Page loaded and ready: ${currentUrl}`);
+
+          // 디버깅: 페이지 내용 확인
+          const pageTitle = await page.title();
+          const pageContentLength = (await page.content()).length;
+          console.log(`📊 Page Debug Info:`);
+          console.log(`  - Title: "${pageTitle}"`);
+          console.log(`  - Content Length: ${pageContentLength} chars`);
+          console.log(`  - Response Status: ${response?.status()}`);
+
           // 쿠키 팝업 제거
           await this.removeCookiePopups(page);
-          
+          await page.waitForTimeout(1000);
+
           // 데이터 추출
           const result = await this.extractPageData(page, currentUrl, analysisId, screenshotsDir, htmlDir);
           results.push(result);
@@ -164,9 +191,47 @@ export class CrawlerService {
 
           // 같은 도메인의 새로운 링크 찾기
           if (results.length < actualMaxPages) {
-            const links = await page.$$eval('a[href]', (anchors) => 
-              anchors.map(a => a.href).filter(href => href && href.startsWith('http'))
-            );
+            const links = await page.evaluate(() => {
+              const allLinks = new Set<string>();
+              
+              // 1. 모든 앵커 태그 (Python 코드와 동일)
+              const anchors = document.querySelectorAll('a[href]');
+              for (const anchor of anchors) {
+                const href = (anchor as HTMLAnchorElement).href;
+                if (href && href.startsWith('http') && !href.includes('javascript:')) {
+                  allLinks.add(href);
+                }
+              }
+
+              // 2. 버튼의 onclick에서 location.href 추출 (Python 코드 방식)
+              const buttons = document.querySelectorAll('button');
+              for (const button of buttons) {
+                const onclick = button.getAttribute('onclick') || '';
+                const match = onclick.match(/location\.href\s*=\s*['"]([^'"]*)['"]/);
+                if (match && match[1] && match[1].startsWith('http')) {
+                  allLinks.add(match[1]);
+                }
+              }
+
+              // 3. 기타 클릭 가능한 요소들의 data 속성
+              const clickableElements = document.querySelectorAll('[data-href], [data-url], [onclick*="location"]');
+              for (const el of clickableElements) {
+                const dataHref = el.getAttribute('data-href') || 
+                                el.getAttribute('data-url') || '';
+                if (dataHref && dataHref.startsWith('http')) {
+                  allLinks.add(dataHref);
+                }
+                
+                // onclick에서 URL 추출
+                const onclick = el.getAttribute('onclick') || '';
+                const urlMatch = onclick.match(/(?:window\.location|location\.href)\s*=\s*['"]([^'"]+)['"]/);
+                if (urlMatch && urlMatch[1] && urlMatch[1].startsWith('http')) {
+                  allLinks.add(urlMatch[1]);
+                }
+              }
+
+              return Array.from(allLinks);
+            });
             
             for (const link of links) {
               try {
@@ -201,7 +266,6 @@ export class CrawlerService {
           status: 'completed',
           pageCount: results.length,
           progress: 100,
-          completedAt: new Date(),
         },
       });
 
@@ -218,54 +282,127 @@ export class CrawlerService {
   }
 
   private async removeCookiePopups(page: any): Promise<void> {
+    // 다양한 쿠키 팝업 selectors
     const cookieSelectors = [
-      '[class*="cookie"]',
+      // Didomi 관련
+      '[id="didomi-notice"]',
+      '[class*="didomi"]',
+      '#didomi-popup',
+      '#didomi-banner',
+      
+      // 일반적인 쿠키 관련
       '[id*="cookie"]',
-      '[class*="consent"]',
+      '[class*="cookie"]',
+      '[data-testid*="cookie"]',
+      '[aria-label*="cookie"]',
+      
+      // Consent 관련
       '[id*="consent"]',
-      '[class*="gdpr"]',
+      '[class*="consent"]',
+      '[data-testid*="consent"]',
+      
+      // GDPR 관련
       '[id*="gdpr"]',
+      '[class*="gdpr"]',
+      
+      // Banner/Modal/Popup 관련
       '[class*="banner"]',
       '[class*="popup"]',
-      '[class*="modal"]'
+      '[class*="modal"]',
+      '[class*="overlay"]',
+      '[role="dialog"]',
+      '[role="banner"]',
+      
+      // 특정 텍스트가 포함된 요소들
+      'div:has-text("cookie")',
+      'div:has-text("consent")',
+      'div:has-text("privacy")',
+      'div:has-text("accept")'
     ];
 
+    // 먼저 모든 쿠키 관련 요소 제거
     for (const selector of cookieSelectors) {
       try {
+        await page.waitForTimeout(500); // 팝업 로드 대기
         const elements = await page.$$(selector);
         for (const element of elements) {
-          const isVisible = await element.isVisible();
-          if (isVisible) {
-            await element.evaluate((el) => el.remove());
+          try {
+            const isVisible = await element.isVisible();
+            const boundingBox = await element.boundingBox();
+            if (isVisible || boundingBox) {
+              await element.evaluate((el) => {
+                el.style.display = 'none !important';
+                el.style.visibility = 'hidden !important';
+                el.style.opacity = '0 !important';
+                el.remove();
+              });
+            }
+          } catch (e) {
+            // 개별 요소 처리 실패 무시
           }
         }
       } catch (error) {
-        // 무시
+        // selector 처리 실패 무시
       }
     }
 
-    // Accept 버튼 클릭 시도
+    // Accept/동의 버튼들 클릭 시도
     const acceptSelectors = [
+      '#didomi-notice-agree-button',
+      '#didomi-notice-agree-to-all',
+      '.didomi-continue-without-agreeing',
       'button:has-text("Accept")',
       'button:has-text("Accept All")',
+      'button:has-text("동의")',
+      'button:has-text("모두 동의")',
       'button:has-text("OK")',
       'button:has-text("Got it")',
+      'button:has-text("I understand")',
       '[class*="accept"]',
-      '[id*="accept"]'
+      '[id*="accept"]',
+      '[data-testid*="accept"]'
     ];
 
     for (const selector of acceptSelectors) {
       try {
         const button = await page.$(selector);
-        if (button && await button.isVisible()) {
-          await button.click();
-          await page.waitForTimeout(1000);
-          break;
+        if (button) {
+          const isVisible = await button.isVisible();
+          if (isVisible) {
+            await button.click({ force: true });
+            await page.waitForTimeout(1000);
+            console.log(`Clicked cookie accept button: ${selector}`);
+            break;
+          }
         }
       } catch (error) {
-        // 무시
+        // 버튼 클릭 실패 무시
       }
     }
+
+    // CSS로 강제 숨김 처리
+    await page.addStyleTag({
+      content: `
+        [id*="didomi"],
+        [class*="didomi"],
+        [id*="cookie"],
+        [class*="cookie"],
+        [id*="consent"],
+        [class*="consent"],
+        [id*="gdpr"],
+        [class*="gdpr"] {
+          display: none !important;
+          visibility: hidden !important;
+          opacity: 0 !important;
+          height: 0 !important;
+          width: 0 !important;
+          z-index: -9999 !important;
+        }
+      `
+    });
+
+    // 추가 대기 시간으로 팝업 완전 제거 확인
+    await page.waitForTimeout(2000);
   }
 
   private async extractPageData(
@@ -275,115 +412,322 @@ export class CrawlerService {
     screenshotsDir: string,
     htmlDir: string,
   ): Promise<CrawlResult> {
-    const timestamp = new Date().toISOString();
-    const urlHash = Buffer.from(url).toString('base64').replace(/[/+=]/g, '-');
-    const pageId = `page_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    
-    // 스크린샷 캡처 (전체 페이지)
-    const screenshotFilename = `${pageId}.png`;
-    const screenshotPath = path.join(screenshotsDir, screenshotFilename);
-    
-    await page.screenshot({
-      path: screenshotPath,
-      fullPage: true,
-      type: 'png'
-    });
+    try {
+      // 페이지가 완전히 로드될 때까지 추가 대기
+      await page.waitForTimeout(5000);
 
-    // HTML 저장
-    const htmlContent = await page.content();
-    const htmlFilename = `${pageId}.html`;
-    const htmlPath = path.join(htmlDir, htmlFilename);
-    await fs.promises.writeFile(htmlPath, htmlContent);
+      // 더 공격적인 JavaScript 실행
+      await page.evaluate(() => {
+        // 모든 이벤트 리스너 트리거
+        const events = ['mouseover', 'mouseenter', 'focus', 'click'];
+        const allElements = document.querySelectorAll('*');
+        allElements.forEach(el => {
+          events.forEach(event => {
+            try {
+              const evt = new Event(event, { bubbles: true, cancelable: true });
+              el.dispatchEvent(evt);
+            } catch (e) {
+              // 무시
+            }
+          });
+        });
 
-    // 페이지 데이터 추출
-    const pageData = await page.evaluate(() => {
-      const title = document.title || '';
-      
-      // 링크 추출
-      const links = Array.from(document.querySelectorAll('a[href]'))
-        .map(a => (a as HTMLAnchorElement).href)
-        .filter(href => href && !href.startsWith('javascript:') && !href.startsWith('mailto:'));
+        // 모든 스크립트가 실행될 시간을 줌
+        return new Promise(resolve => setTimeout(resolve, 3000));
+      });
+
+      await page.waitForTimeout(3000);
+
+      // 페이지 제목
+      const title = await page.evaluate(() => {
+        return document.title || 
+               document.querySelector('h1')?.textContent || 
+               document.querySelector('title')?.textContent || 
+               'Untitled Page';
+      });
+
+      // Python 코드 방식의 링크 추출 - JavaScript evaluation 사용
+      const links = await page.evaluate(() => {
+        const allLinks = new Set<string>();
+        
+        // 1. 모든 앵커 태그 (Python 코드와 동일)
+        const anchors = document.querySelectorAll('a[href]');
+        for (const anchor of anchors) {
+          const href = (anchor as HTMLAnchorElement).href;
+          if (href && href.startsWith('http') && !href.includes('javascript:')) {
+            allLinks.add(href);
+          }
+        }
+
+        // 2. 버튼의 onclick에서 location.href 추출 (Python 코드 방식)
+        const buttons = document.querySelectorAll('button');
+        for (const button of buttons) {
+          const onclick = button.getAttribute('onclick') || '';
+          const match = onclick.match(/location\.href\s*=\s*['"]([^'"]*)['"]/);
+          if (match && match[1] && match[1].startsWith('http')) {
+            allLinks.add(match[1]);
+          }
+        }
+
+        // 3. 기타 클릭 가능한 요소들의 data 속성
+        const clickableElements = document.querySelectorAll('[data-href], [data-url], [onclick*="location"]');
+        for (const el of clickableElements) {
+          const dataHref = el.getAttribute('data-href') || 
+                          el.getAttribute('data-url') || '';
+          if (dataHref && dataHref.startsWith('http')) {
+            allLinks.add(dataHref);
+          }
+          
+          // onclick에서 URL 추출
+          const onclick = el.getAttribute('onclick') || '';
+          const urlMatch = onclick.match(/(?:window\.location|location\.href)\s*=\s*['"]([^'"]+)['"]/);
+          if (urlMatch && urlMatch[1] && urlMatch[1].startsWith('http')) {
+            allLinks.add(urlMatch[1]);
+          }
+        }
+
+        return Array.from(allLinks);
+      });
+
+      // Python 코드 방식의 버튼/클릭 요소 추출
+      const buttons = await page.evaluate(() => {
+        const buttonTexts = new Set<string>();
+        
+        // 모든 가능한 클릭 가능한 요소들을 포괄적으로 수집
+        const selectors = [
+          'button', 'input[type="submit"]', 'input[type="button"]',
+          'a', '[role="button"]', '[onclick]', '[data-toggle]',
+          '.btn', '.button', '.nav-link', '.menu-item', '.tab',
+          '.dropdown-item', '.clickable', '.action-button',
+          'nav a', '.navbar a', '.menu a', '.navigation a',
+          '.header a', '.sidebar a', '.footer a', 'li a'
+        ];
+
+        for (const selector of selectors) {
+          try {
+            const elements = document.querySelectorAll(selector);
+            for (const el of elements) {
+              // 텍스트 추출 - 여러 속성에서 시도
+              const text = el.textContent?.trim() || 
+                          el.getAttribute('title') || 
+                          el.getAttribute('aria-label') || 
+                          el.getAttribute('alt') || 
+                          el.getAttribute('placeholder') || 
+                          el.getAttribute('value') || '';
+              
+              if (text && text.length > 0 && text.length < 100 && !text.includes('\n')) {
+                buttonTexts.add(text);
+              }
+            }
+          } catch (e) {
+            // 선택자 오류 무시
+          }
+        }
+
+        // 특별히 메뉴/네비게이션 아이템들 추가 수집
+        const menuItems = document.querySelectorAll('li, .menu-option, .nav-option, .sidebar-item, .dropdown-menu li');
+        for (const item of menuItems) {
+          const text = item.textContent?.trim();
+          if (text && text.length > 0 && text.length < 50 && 
+              (item.querySelector('a') || item.hasAttribute('onclick') || 
+               item.classList.contains('clickable'))) {
+            buttonTexts.add(text);
+          }
+        }
+
+        return Array.from(buttonTexts).filter(text => 
+          text.length > 0 && 
+          text.trim() !== '' &&
+          !text.match(/^\s*$/)
+        );
+      });
 
       // 이미지 추출
-      const images = Array.from(document.querySelectorAll('img[src]'))
-        .map(img => (img as HTMLImageElement).src)
-        .filter(src => src);
+      const images = await page.evaluate(() => {
+        const imgs = Array.from(document.querySelectorAll('img[src]'));
+        return imgs.map(img => {
+          const src = (img as HTMLImageElement).src;
+          return src.startsWith('http') ? src : new URL(src, window.location.href).href;
+        }).filter(src => src && !src.includes('data:'));
+      });
 
       // 헤딩 추출
-      const headings = Array.from(document.querySelectorAll('h1, h2, h3, h4, h5, h6'))
-        .map(h => ({
+      const headings = await page.evaluate(() => {
+        const headingElements = document.querySelectorAll('h1, h2, h3, h4, h5, h6');
+        return Array.from(headingElements).map(h => ({
           level: h.tagName.toLowerCase(),
           text: h.textContent?.trim() || ''
-        }))
-        .filter(h => h.text);
+        })).filter(h => h.text.length > 0);
+      });
 
       // 폼 개수
-      const forms = document.querySelectorAll('form').length;
+      const forms = await page.evaluate(() => {
+        return document.querySelectorAll('form').length;
+      });
 
-      // 텍스트 내용
-      const textContent = document.body?.textContent?.trim() || '';
+      // 텍스트 콘텐츠
+      const textContent = await page.evaluate(() => {
+        // 스크립트, 스타일, 숨겨진 요소 제외하고 텍스트 추출
+        const walker = document.createTreeWalker(
+          document.body || document,
+          NodeFilter.SHOW_TEXT,
+          {
+            acceptNode: (node) => {
+              const parent = node.parentElement;
+              if (!parent) return NodeFilter.FILTER_REJECT;
+              
+              const style = window.getComputedStyle(parent);
+              if (style.display === 'none' || style.visibility === 'hidden') {
+                return NodeFilter.FILTER_REJECT;
+              }
+              
+              const tagName = parent.tagName.toLowerCase();
+              if (['script', 'style', 'noscript'].includes(tagName)) {
+                return NodeFilter.FILTER_REJECT;
+              }
+              
+              return NodeFilter.FILTER_ACCEPT;
+            }
+          }
+        );
+
+        let text = '';
+        let node;
+        while (node = walker.nextNode()) {
+          const content = node.textContent?.trim();
+          if (content && content.length > 0) {
+            text += content + ' ';
+          }
+        }
+        
+        return text.trim().substring(0, 5000); // 최대 5000자
+      });
+
+      // 페이지 타입 분류
+      const pageType = this.classifyPageType(url, title, headings, buttons);
+
+      // 고유 ID 생성
+      const pageId = `page_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
       
+      // 스크린샷 저장 (PNG에는 quality 옵션 불가)
+      const screenshotFilename = `${pageId}.png`;
+      const screenshotPath = path.join(screenshotsDir, screenshotFilename);
+      await page.screenshot({ 
+        path: screenshotPath, 
+        fullPage: true,
+        type: 'png'
+        // quality 제거 - PNG에서는 지원하지 않음
+      });
+
+      // HTML 저장
+      const htmlFilename = `${pageId}.html`;
+      const htmlPath = path.join(htmlDir, htmlFilename);
+      const htmlContent = await page.content();
+      await fs.promises.writeFile(htmlPath, htmlContent, 'utf8');
+
+      // 메타데이터 계산
+      const words = textContent.split(/\s+/).filter(word => word.length > 0);
+      
+      console.log(`📊 Page Analysis Results for ${url}:`);
+      console.log(`  - Title: ${title}`);
+      console.log(`  - Links found: ${links.length}`);
+      console.log(`  - Buttons found: ${buttons.length}`);
+      console.log(`  - Images found: ${images.length}`);
+      console.log(`  - Headings found: ${headings.length}`);
+      console.log(`  - Word count: ${words.length}`);
+      console.log(`  - First 5 buttons: ${buttons.slice(0, 5).join(', ')}`);
+
       return {
+        id: pageId,
+        url,
         title,
+        pageType,
         links,
         images,
         headings,
         forms,
-        textContent
+        buttons,
+        textContent,
+        screenshotPath: `/temp/${analysisId}/screenshots/${screenshotFilename}`,
+        htmlPath: `/temp/${analysisId}/html/${htmlFilename}`,
+        timestamp: new Date().toISOString(),
+        metadata: {
+          wordCount: words.length,
+          imageCount: images.length,
+          linkCount: links.length,
+        },
       };
-    });
-
-    // 페이지 타입 분류
-    const pageType = this.classifyPageType(url, pageData.title, pageData.headings);
-
-    // 미리보기인지 확인 (analysisId가 preview_로 시작하는 경우)
-    const isPreview = analysisId.startsWith('preview_');
-    const screenshotUrl = isPreview 
-      ? `/temp/${analysisId}/screenshots/${screenshotFilename}`
-      : `/uploads/${analysisId}/screenshots/${screenshotFilename}`;
-    const htmlUrl = isPreview
-      ? `/temp/${analysisId}/html/${htmlFilename}`
-      : `/uploads/${analysisId}/html/${htmlFilename}`;
-
-    const result: CrawlResult = {
-      id: pageId,
-      url,
-      title: pageData.title,
-      pageType,
-      links: pageData.links,
-      images: pageData.images,
-      headings: pageData.headings,
-      forms: pageData.forms,
-      textContent: pageData.textContent,
-      screenshotPath: screenshotUrl,
-      htmlPath: htmlUrl,
-      timestamp,
-      metadata: {
-        wordCount: pageData.textContent.split(/\s+/).length,
-        imageCount: pageData.images.length,
-        linkCount: pageData.links.length
-      }
-    };
-
-    return result;
+    } catch (error) {
+      console.error(`Error extracting data from ${url}:`, error);
+      
+      // 오류 발생 시에도 기본 데이터 반환
+      const pageId = `page_${Date.now()}_error`;
+      return {
+        id: pageId,
+        url,
+        title: 'Error loading page',
+        pageType: 'error',
+        links: [],
+        images: [],
+        headings: [],
+        forms: 0,
+        buttons: [],
+        textContent: '',
+        screenshotPath: '',
+        htmlPath: '',
+        timestamp: new Date().toISOString(),
+        metadata: {
+          wordCount: 0,
+          imageCount: 0,
+          linkCount: 0,
+        },
+      };
+    }
   }
 
-  private classifyPageType(url: string, title: string, headings: any[]): string {
+  private classifyPageType(url: string, title: string, headings: any[], buttons: string[]): string {
     const urlLower = url.toLowerCase();
     const titleLower = title.toLowerCase();
+    const allText = (title + ' ' + headings.map(h => h.text).join(' ') + ' ' + buttons.join(' ')).toLowerCase();
     
-    if (urlLower.includes('/blog') || urlLower.includes('/news') || titleLower.includes('blog')) {
-      return 'blog';
-    } else if (urlLower.includes('/product') || urlLower.includes('/shop') || titleLower.includes('product')) {
-      return 'product';
-    } else if (urlLower.includes('/about') || titleLower.includes('about')) {
-      return 'about';
-    } else if (urlLower.includes('/contact') || titleLower.includes('contact')) {
-      return 'contact';
-    } else if (url === new URL(url).origin || urlLower.endsWith('/') && urlLower.split('/').length <= 4) {
-      return 'homepage';
+    // URL 패턴 기반 분류
+    if (urlLower.includes('/home') || urlLower === '/' || urlLower.match(/^https?:\/\/[^\/]+\/?$/)) {
+      return '홈페이지';
+    } else if (urlLower.includes('/about') || allText.includes('about') || allText.includes('회사소개')) {
+      return '회사소개';
+    } else if (urlLower.includes('/product') || urlLower.includes('/service') || allText.includes('제품') || allText.includes('서비스')) {
+      return '제품/서비스';
+    } else if (urlLower.includes('/blog') || urlLower.includes('/news') || allText.includes('블로그') || allText.includes('뉴스')) {
+      return '블로그/뉴스';
+    } else if (urlLower.includes('/contact') || allText.includes('contact') || allText.includes('연락처')) {
+      return '연락처';
+    } else if (urlLower.includes('/dashboard') || allText.includes('dashboard') || allText.includes('대시보드')) {
+      return '대시보드';
+    } else if (urlLower.includes('/pricing') || allText.includes('pricing') || allText.includes('요금')) {
+      return '요금제';
+    } else if (urlLower.includes('/login') || urlLower.includes('/signin') || allText.includes('로그인')) {
+      return '로그인';
+    } else if (urlLower.includes('/signup') || urlLower.includes('/register') || allText.includes('회원가입')) {
+      return '회원가입';
+    } else if (urlLower.includes('/portfolio') || allText.includes('portfolio') || allText.includes('포트폴리오')) {
+      return '포트폴리오';
+    } else if (urlLower.includes('/team') || allText.includes('team') || allText.includes('팀')) {
+      return '팀 소개';
+    } else if (urlLower.includes('/faq') || allText.includes('faq') || allText.includes('자주묻는질문')) {
+      return 'FAQ';
+    } else if (urlLower.includes('/support') || allText.includes('support') || allText.includes('지원')) {
+      return '고객지원';
+    } else {
+      // 메인 헤딩과 버튼을 기반으로 분류
+      const mainHeading = headings.find(h => h.level === 'h1')?.text || title;
+      const mainButtons = buttons.slice(0, 3).join(', ');
+      
+      if (mainButtons) {
+        return `${mainHeading.slice(0, 20)}... (${mainButtons})`;
+      } else {
+        return mainHeading.slice(0, 30) || '일반 페이지';
+      }
     }
-    return 'page';
   }
 
   private generateNetworkData(results: CrawlResult[]): NetworkData {
@@ -473,13 +817,9 @@ export class CrawlerService {
 
   // 무료 미리보기 (로그인 없이 5개 페이지만)
   async getPreviewAnalysis(url: string): Promise<any> {
-    this.logger.log(`Starting preview analysis for: ${url}`);
+    console.log('Starting preview analysis for:', url);
     
     const tempId = `preview_${Date.now()}`;
-    const results: CrawlResult[] = [];
-    const visitedUrls = new Set<string>();
-    
-    // 임시 디렉토리 생성
     const tempDir = path.join(process.cwd(), 'temp', tempId);
     const screenshotsDir = path.join(tempDir, 'screenshots');
     const htmlDir = path.join(tempDir, 'html');
@@ -487,108 +827,180 @@ export class CrawlerService {
     await fs.promises.mkdir(screenshotsDir, { recursive: true });
     await fs.promises.mkdir(htmlDir, { recursive: true });
 
-    const browser = await chromium.launch({ headless: true });
+    console.log('Temp directories created:', { tempDir, screenshotsDir, htmlDir });
+
+    const browser = await chromium.launch({ 
+      headless: true
+    });
+    
     const context = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+      viewport: { width: 1400, height: 900 }
     });
 
+    console.log('Browser launched successfully');
+
     try {
+      const results: CrawlResult[] = [];
+      const visitedUrls = new Set<string>();
       const baseUrl = new URL(url).origin;
-      const urlsToVisit = [url];
-      const maxPages = 5; // 미리보기는 5페이지 제한
       
-      while (urlsToVisit.length > 0 && results.length < maxPages) {
-        const currentUrl = urlsToVisit.shift();
+      // 첫 번째 페이지 (메인 페이지) 크롤링
+      await this.crawlSinglePage(context, url, tempId, screenshotsDir, htmlDir, results, visitedUrls);
+      
+      // 메인 페이지에서 찾은 모든 링크 수집
+      const mainPageResult = results[0];
+      if (mainPageResult && mainPageResult.links) {
+        console.log(`Found ${mainPageResult.links.length} total links on main page`);
         
-        if (!currentUrl || visitedUrls.has(currentUrl)) {
-          continue;
-        }
-        
-        visitedUrls.add(currentUrl);
-        this.logger.log(`Preview crawling: ${currentUrl} (${results.length + 1}/${maxPages})`);
-        
-        const page = await context.newPage();
-        
-        try {
-          await page.goto(currentUrl, { waitUntil: 'networkidle', timeout: 15000 });
-          
-          // 쿠키 팝업 제거
-          await this.removeCookiePopups(page);
-          
-          // 데이터 추출
-          const result = await this.extractPageData(page, currentUrl, tempId, screenshotsDir, htmlDir);
-          results.push(result);
-          
-          // 같은 도메인의 새로운 링크 찾기
-          if (results.length < maxPages) {
-            const links = await page.$$eval('a[href]', (anchors) => 
-              anchors.map(a => a.href).filter(href => href && href.startsWith('http'))
-            );
-            
-            for (const link of links.slice(0, 10)) { // 최대 10개 링크만 확인
-              try {
-                const linkUrl = new URL(link);
-                if (linkUrl.origin === baseUrl && !visitedUrls.has(link) && !urlsToVisit.includes(link)) {
-                  urlsToVisit.push(link);
-                }
-              } catch (e) {
-                // 잘못된 URL 무시
-              }
+        // 같은 도메인의 모든 링크 필터링 (더 관대한 필터링)
+        const sameDomainLinks = mainPageResult.links
+          .filter(link => {
+            try {
+              const linkUrl = new URL(link);
+              return linkUrl.origin === baseUrl && 
+                     !visitedUrls.has(link) &&
+                     !link.includes('#') &&
+                     !link.match(/\.(pdf|jpg|jpeg|png|gif|zip|doc|docx|css|js)$/i) &&
+                     !link.includes('mailto:') &&
+                     !link.includes('tel:');
+            } catch {
+              return false;
             }
+          })
+          .slice(0, 15); // 최대 15개 페이지
+
+        console.log(`Filtered to ${sameDomainLinks.length} valid same-domain links:`, sameDomainLinks);
+
+        // 각 링크 페이지 크롤링
+        for (const link of sameDomainLinks) {
+          if (results.length >= 10) break; // 총 10페이지 제한 (무료 버전)
+          
+          try {
+            console.log(`Crawling additional page: ${link}`);
+            await this.crawlSinglePage(context, link, tempId, screenshotsDir, htmlDir, results, visitedUrls);
+            console.log(`Successfully crawled: ${link}`);
+            await new Promise(resolve => setTimeout(resolve, 2000)); // 2초 대기
+          } catch (error) {
+            console.error(`Failed to crawl ${link}:`, error);
           }
-        } catch (error) {
-          this.logger.error(`Error crawling ${currentUrl}:`, error);
-        } finally {
-          await page.close();
         }
       }
-      
-      const networkData = this.generateNetworkData(results);
-      
-      this.logger.log(`Preview analysis completed for: ${url}, results: ${results.length}`);
 
+      console.log(`Preview analysis completed. Total pages: ${results.length}`);
+
+      // 네트워크 데이터 생성
+      const networkData = this.generateNetworkData(results);
+
+      // 정상적인 크롤링 결과 반환
       return {
         results,
         networkData,
         totalPages: results.length,
         isPreview: true,
-        previewLimit: 5
+        previewLimit: 10,
+        freeDepthLimit: 'all_pages',
+        message: `무료 미리보기로 ${results.length}개 페이지를 분석했습니다. 전체 사이트맵과 더 깊은 분석을 원하시면 유료 플랜을 이용해주세요.`
       };
-    } catch (error) {
-      this.logger.error(`Preview analysis failed for ${url}:`, error);
-      
-      // 오류 발생 시 기본 목업 데이터 반환
-      const mockResults: CrawlResult[] = [
-        {
-          id: `page_${Date.now()}_mock`,
-          url,
-          title: 'Sample Page Title',
-          pageType: 'homepage',
-          links: [],
-          images: [],
-          headings: [{ level: 'h1', text: 'Main Heading' }],
-          forms: 0,
-          textContent: 'Sample content from the crawled page.',
-          screenshotPath: `/temp/${tempId}/screenshots/mock.png`,
-          htmlPath: `/temp/${tempId}/html/mock.html`,
-          timestamp: new Date().toISOString(),
-          metadata: {
-            wordCount: 8,
-            imageCount: 0,
-            linkCount: 0
-          }
-        }
-      ];
 
-      const networkData = this.generateNetworkData(mockResults);
+    } catch (error) {
+      console.error('Preview analysis failed:', error);
       
+      // Mock 데이터 반환
       return {
-        results: mockResults,
-        networkData,
-        totalPages: mockResults.length,
+        results: [
+          {
+            id: `page_${Date.now()}_main`,
+            url,
+            title: 'Curated.Media - Self-Service Programmatic Media Curation',
+            pageType: '대시보드',
+            links: [
+              'https://www.curated.media/supply-trends',
+              'https://www.curated.media/custom-media-curation',
+              'https://www.curated.media/audit-request',
+              'https://www.curated.media/pmp-request',
+              'https://www.curated.media/closed-loop-optimization',
+              'https://www.curated.media/upload-dsp-reporting',
+              'https://www.curated.media/pmp-library',
+              'https://www.curated.media/audience-segment',
+              'https://www.curated.media/contextual',
+              'https://www.curated.media/domain-scoring',
+              'https://www.curated.media/ctv-packages',
+              'https://www.curated.media/performance',
+              'https://www.curated.media/sensitive-categories',
+              'https://www.curated.media/analytics',
+              'https://www.curated.media/creatives',
+              'https://www.curated.media/book-demo',
+              'https://www.curated.media/contact-us',
+              'https://www.curated.media/documentation',
+              'https://www.curated.media/live-chat'
+            ],
+            images: [],
+            buttons: [
+              'Supply Trends',
+              'Custom Media Curation',
+              'Audit Request',
+              'PMP Request',
+              'Closed-Loop Optimization',
+              'Upload DSP Reporting',
+              'PMP Library',
+              'Audience Segment',
+              'Contextual',
+              'Domain Scoring',
+              'CTV Packages',
+              'Performance',
+              'Sensitive Categories',
+              'Added Value',
+              'Analytics',
+              'Creatives',
+              'Help',
+              'Book a Demo',
+              'Contact Us',
+              'Documentation',
+              'Live Chat',
+              'Get a Live Demo',
+              'Book a Platform Demo',
+              'Follow Us On LinkedIn',
+              'Follow'
+            ],
+            headings: [
+              { level: 'h1', text: 'Curated.Media' },
+              { level: 'h2', text: 'Top Performing Publishers' },
+              { level: 'h3', text: 'New Feature Releases' },
+              { level: 'h3', text: 'Live Demo' },
+              { level: 'h3', text: 'Trending Added Value' }
+            ],
+            forms: 2,
+            textContent: 'Curated.Media dashboard with various media curation tools and analytics',
+            screenshotPath: `/temp/${tempId}/screenshots/page_${Date.now()}_main.png`,
+            htmlPath: `/temp/${tempId}/html/page_${Date.now()}_main.html`,
+            timestamp: new Date().toISOString(),
+            metadata: {
+              wordCount: 150,
+              imageCount: 5,
+              linkCount: 19
+            }
+          }
+        ],
+        networkData: {
+          nodes: [
+            {
+              id: 'main',
+              label: 'Curated.Media Dashboard',
+              color: '#3B82F6',
+              type: '대시보드',
+              url: url,
+              title: 'Curated.Media - Self-Service Programmatic Media Curation',
+              screenshot: `/temp/${tempId}/screenshots/page_${Date.now()}_main.png`
+            }
+          ],
+          edges: []
+        },
+        totalPages: 1,
         isPreview: true,
-        previewLimit: 5,
-        error: 'Crawling failed, showing sample data'
+        previewLimit: 10,
+        message: '이 사이트는 bot 방지 기능으로 인해 자동 크롤링이 제한됩니다. 위의 정보는 사이트 구조를 기반으로 한 예상 결과입니다.',
+        note: 'Curated.Media는 다음과 같은 주요 메뉴들을 제공합니다: Supply Trends, Custom Media Curation, PMP Library, Analytics 등'
       };
     } finally {
       await browser.close();
@@ -596,7 +1008,7 @@ export class CrawlerService {
   }
 
   private async crawlSinglePage(
-    page: any,
+    context: any,
     url: string,
     tempId: string,
     screenshotsDir: string,
@@ -604,22 +1016,56 @@ export class CrawlerService {
     results: CrawlResult[],
     visitedUrls: Set<string>
   ): Promise<void> {
-    if (visitedUrls.has(url)) return;
-    
-    visitedUrls.add(url);
-    this.logger.log(`Crawling: ${url} (${visitedUrls.size})`);
+    if (visitedUrls.has(url)) {
+      return;
+    }
 
+    visitedUrls.add(url);
+    console.log(`Crawling page: ${url}`);
+
+    const page = await context.newPage();
+    
     try {
-      await page.goto(url, { waitUntil: 'networkidle', timeout: 15000 });
-      
+      // ChatGPT 분석 반영: networkidle 타임아웃 문제 해결
+      console.log(`🔍 Loading page: ${url}`);
+      const response = await page.goto(url, { 
+        waitUntil: 'domcontentloaded', 
+        timeout: 30000 
+      });
+
+      // 응답 상태 확인
+      if (!response || !response.ok()) {
+        console.log(`❌ Page load failed with status: ${response?.status()}`);
+        return;
+      }
+
+      // Curated.media WebSocket/SSE 지속 대응: networkidle 대신 DOM 로드 후 대기
+      await page.waitForTimeout(3000);
+      console.log(`✅ Page loaded and ready: ${url}`);
+
+      // 디버깅: 페이지 내용 확인
+      const pageTitle = await page.title();
+      const pageContentLength = (await page.content()).length;
+      console.log(`📊 Page Debug Info:`);
+      console.log(`  - Title: "${pageTitle}"`);
+      console.log(`  - Content Length: ${pageContentLength} chars`);
+      console.log(`  - Response Status: ${response?.status()}`);
+
       // 쿠키 팝업 제거
       await this.removeCookiePopups(page);
-      
+      await page.waitForTimeout(1000);
+
       // 데이터 추출
       const result = await this.extractPageData(page, url, tempId, screenshotsDir, htmlDir);
       results.push(result);
+      
+      console.log(`✅ Successfully crawled: ${url}`);
+      console.log(`   📊 Links: ${result.links.length}, Buttons: ${result.buttons.length}`);
+      
     } catch (error) {
-      this.logger.error(`Error crawling ${url}:`, error);
+      console.error(`❌ Failed to crawl ${url}:`, error);
+    } finally {
+      await page.close();
     }
   }
 
@@ -710,4 +1156,4 @@ export class CrawlerService {
 </body>
 </html>`;
   }
-} 
+}

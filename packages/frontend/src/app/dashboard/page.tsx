@@ -40,50 +40,57 @@ export default function Dashboard() {
       return
     }
 
-    fetchUserData()
+    fetchUserProfile()
     fetchAnalyses()
   }, [router])
 
-  const fetchUserData = async () => {
+  const fetchUserProfile = async () => {
     try {
       const token = localStorage.getItem('token')
-      const response = await fetch('http://localhost:3000/auth/profile', {
+      if (!token) {
+        router.push('/login')
+        return
+      }
+
+      const response = await fetch('/api/auth/profile', {
         headers: {
           'Authorization': `Bearer ${token}`
         }
       })
 
       if (response.ok) {
-        const userData = await response.json()
-        setUser(userData)
+        const profile = await response.json()
+        setUser(profile)
       } else {
         localStorage.removeItem('token')
         router.push('/login')
       }
     } catch (error) {
-      console.error('Failed to fetch user data:', error)
+      console.error('Failed to fetch user profile:', error)
       localStorage.removeItem('token')
       router.push('/login')
+    } finally {
+      setLoading(false)
     }
   }
 
   const fetchAnalyses = async () => {
     try {
       const token = localStorage.getItem('token')
-      const response = await fetch('http://localhost:3000/crawler/analyses', {
+      if (!token) return
+
+      const response = await fetch('/api/crawler/analyses', {
         headers: {
           'Authorization': `Bearer ${token}`
         }
       })
 
       if (response.ok) {
-        const analysesData = await response.json()
-        setAnalyses(analysesData)
+        const data = await response.json()
+        setAnalyses(data)
       }
     } catch (error) {
       console.error('Failed to fetch analyses:', error)
-    } finally {
-      setLoading(false)
     }
   }
 
@@ -103,7 +110,7 @@ export default function Dashboard() {
 
     try {
       const token = localStorage.getItem('token')
-      const response = await fetch('http://localhost:3000/crawler/start', {
+      const response = await fetch('/api/crawler/start', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

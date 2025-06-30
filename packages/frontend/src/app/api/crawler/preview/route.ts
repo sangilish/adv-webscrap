@@ -1,5 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 
+// Edge runtime에서는 로컬 백엔드(HTTP) 호출이 차단되므로 Node.js 런타임을 명시합니다.
+export const runtime = 'nodejs';
+
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();

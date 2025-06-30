@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import React, { useState, useEffect } from 'react'
 import { useSearchParams, useRouter } from 'next/navigation'
 import Link from 'next/link'
 
@@ -39,6 +39,7 @@ interface CrawlResult {
   images: string[]
   headings: { level: string; text: string }[]
   forms: number
+  buttons: string[]
   textContent: string
   screenshotPath: string
   htmlPath: string
@@ -49,6 +50,58 @@ interface CrawlResult {
     linkCount: number
   }
 }
+
+interface PageResult {
+  id: string;
+  url: string;
+  title: string;
+  pageType: string;
+  links: string[];
+  images: string[];
+  buttons: string[];
+  headings: { level: string; text: string }[];
+  forms: number;
+  textContent: string;
+  screenshotPath: string;
+  htmlPath: string;
+  timestamp: string;
+  metadata: {
+    wordCount: number;
+    imageCount: number;
+    linkCount: number;
+  };
+}
+
+interface NetworkNode {
+  id: string;
+  label: string;
+  color: string;
+  type: string;
+  url: string;
+  title: string;
+  screenshot: string;
+}
+
+interface NetworkEdge {
+  from: string;
+  to: string;
+}
+
+interface NetworkData {
+  nodes: NetworkNode[];
+  edges: NetworkEdge[];
+}
+
+interface AnalysisResult {
+  results: PageResult[];
+  networkData: NetworkData;
+  totalPages: number;
+  isPreview: boolean;
+  previewLimit: number;
+  message: string;
+}
+
+type ViewMode = 'structure' | 'network';
 
 export default function AnalyzePage() {
   const searchParams = useSearchParams()
@@ -64,6 +117,9 @@ export default function AnalyzePage() {
   const [analysisId, setAnalysisId] = useState<string | null>(null)
   const [isPreview, setIsPreview] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [viewMode, setViewMode] = useState<ViewMode>('structure')
+  const [result, setResult] = useState<AnalysisResult | null>(null)
+  const [isCheckingAuth, setIsCheckingAuth] = useState(true)
 
   useEffect(() => {
     if (!url) {
@@ -71,8 +127,42 @@ export default function AnalyzePage() {
       return
     }
 
-    startAnalysis()
+    // 로그인 상태 확인
+    checkAuthStatus()
   }, [url, router])
+
+  const checkAuthStatus = async () => {
+    try {
+      const token = localStorage.getItem('token')
+      
+      if (!token) {
+        // 토큰이 없으면 로그인 페이지로 리다이렉트
+        router.push('/login?message=Please log in to analyze websites')
+        return
+      }
+
+      // 토큰 유효성 확인
+      const response = await fetch('/api/auth/profile', {
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
+      })
+
+      if (!response.ok) {
+        // 토큰이 유효하지 않으면 로그인 페이지로 리다이렉트
+        localStorage.removeItem('token')
+        router.push('/login?message=Session expired. Please log in again.')
+        return
+      }
+
+      // 로그인 상태가 확인되면 분석 시작
+      setIsCheckingAuth(false)
+      startAnalysis()
+    } catch (error) {
+      console.error('Auth check failed:', error)
+      router.push('/login?message=Authentication failed. Please log in.')
+    }
+  }
 
   const startAnalysis = async () => {
     try {
@@ -119,6 +209,7 @@ export default function AnalyzePage() {
           
           const calculatedStats = calculateStatsFromResults(data.results)
           setStats(calculatedStats)
+          setResult(data)
         }
         
         setIsAnalyzing(false)
@@ -294,7 +385,10 @@ export default function AnalyzePage() {
     `)
   }
 
-  const renderTreeNode = (node: PageNode) => {
+  const renderTreeNode = (node: PageNode, visited = new Set<string>()): React.ReactNode => {
+    // 순환 참조로 인한 무한 재귀 방지
+    if (visited.has(node.id)) return null;
+    visited.add(node.id);
     const isSelected = selectedNode?.id === node.id
     const indentLevel = node.depth * 20
     
@@ -328,7 +422,119 @@ export default function AnalyzePage() {
             </div>
           )}
         </div>
-        {node.children.map(child => renderTreeNode(child))}
+        {node.children.map(child => renderTreeNode(child, visited))}
+      </div>
+    )
+  }
+
+  const NetworkVisualization = ({ networkData }: { networkData: NetworkData }) => {
+    useEffect(() => {
+      if (!networkData?.nodes?.length) return
+
+      const container = document.getElementById('network-container')
+      if (!container) return
+
+      // Force layout 계산
+      const nodes = networkData.nodes.map((node, index) => ({
+        ...node,
+        x: 400 + Math.cos(index * 2 * Math.PI / networkData.nodes.length) * 150,
+        y: 300 + Math.sin(index * 2 * Math.PI / networkData.nodes.length) * 150,
+        vx: 0,
+        vy: 0
+      }))
+
+      // SVG 생성
+      const svgWidth = 800
+      const svgHeight = 600
+      
+      container.innerHTML = `
+        <div class="bg-white border rounded-lg p-6">
+          <h3 class="text-lg font-semibold mb-4">웹사이트 네트워크 구조</h3>
+          <svg width="${svgWidth}" height="${svgHeight}" style="border: 1px solid #e5e7eb; background: #f9fafb;">
+            <defs>
+              <marker id="arrowhead" markerWidth="10" markerHeight="7" 
+                      refX="9" refY="3.5" orient="auto">
+                <polygon points="0 0, 10 3.5, 0 7" fill="#666" />
+              </marker>
+              <filter id="drop-shadow">
+                <feDropShadow dx="2" dy="2" stdDeviation="3" flood-opacity="0.3"/>
+              </filter>
+            </defs>
+            
+            ${networkData.edges.map(edge => {
+              const fromNode = nodes.find(n => n.id === edge.from)
+              const toNode = nodes.find(n => n.id === edge.to)
+              if (!fromNode || !toNode) return ''
+              
+              return `
+                <line x1="${fromNode.x}" y1="${fromNode.y}" x2="${toNode.x}" y2="${toNode.y}" 
+                      stroke="#94a3b8" stroke-width="2" marker-end="url(#arrowhead)" opacity="0.7" />
+              `
+            }).join('')}
+            
+            ${nodes.map((node, index) => {
+              return `
+                <g class="node-group" data-id="${node.id}" style="cursor: pointer;">
+                  <circle cx="${node.x}" cy="${node.y}" r="40" 
+                          fill="${node.color}" 
+                          stroke="#ffffff" 
+                          stroke-width="3" 
+                          filter="url(#drop-shadow)" />
+                  <text x="${node.x}" y="${node.y - 5}" 
+                        text-anchor="middle" 
+                        fill="white" 
+                        font-size="10" 
+                        font-weight="bold">
+                    ${node.type}
+                  </text>
+                  <text x="${node.x}" y="${node.y + 8}" 
+                        text-anchor="middle" 
+                        fill="white" 
+                        font-size="8">
+                    페이지 ${index + 1}
+                  </text>
+                  <text x="${node.x}" y="${node.y + 65}" 
+                        text-anchor="middle" 
+                        fill="#374151" 
+                        font-size="11" 
+                        font-weight="500"
+                        style="max-width: 100px;">
+                    ${node.label.length > 25 ? node.label.substring(0, 25) + '...' : node.label}
+                  </text>
+                </g>
+              `
+            }).join('')}
+          </svg>
+          
+          <div class="mt-6 grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div class="bg-gray-50 p-4 rounded">
+              <h4 class="font-medium text-gray-900 mb-2">노드 정보</h4>
+              <div class="space-y-2 text-sm">
+                ${nodes.map(node => `
+                  <div class="flex items-center gap-2">
+                    <div class="w-3 h-3 rounded-full" style="background-color: ${node.color}"></div>
+                    <span class="text-gray-700">${node.type}: ${node.label}</span>
+                  </div>
+                `).join('')}
+              </div>
+            </div>
+            
+            <div class="bg-gray-50 p-4 rounded">
+              <h4 class="font-medium text-gray-900 mb-2">연결 통계</h4>
+              <div class="space-y-1 text-sm text-gray-700">
+                <div>총 노드: ${nodes.length}개</div>
+                <div>총 연결: ${networkData.edges.length}개</div>
+                <div>연결 밀도: ${networkData.edges.length > 0 ? ((networkData.edges.length / (nodes.length * (nodes.length - 1))) * 100).toFixed(1) : 0}%</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      `
+    }, [networkData])
+
+    return (
+      <div className="w-full">
+        <div id="network-container" className="flex justify-center"></div>
       </div>
     )
   }
@@ -412,8 +618,8 @@ export default function AnalyzePage() {
           </div>
         )}
 
-        {isAnalyzing ? (
-          /* Analysis in progress */
+        {isCheckingAuth || isAnalyzing ? (
+          /* Authentication check or Analysis in progress */
           <div className="bg-white/90 backdrop-blur-lg rounded-3xl shadow-2xl p-12 text-center border border-white/20">
             <div className="mb-8">
               <div className="w-24 h-24 bg-gradient-to-r from-purple-500 to-blue-500 rounded-full flex items-center justify-center mx-auto mb-6 animate-pulse">
@@ -422,8 +628,15 @@ export default function AnalyzePage() {
                   <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
                 </svg>
               </div>
-              <h2 className="text-3xl font-bold text-gray-800 mb-4">AI is analyzing the website</h2>
-              <p className="text-lg text-gray-600 mb-8">Please wait while we map the site structure...</p>
+              <h2 className="text-3xl font-bold text-gray-800 mb-4">
+                {isCheckingAuth ? 'Verifying Your Access' : 'AI is analyzing the website'}
+              </h2>
+              <p className="text-lg text-gray-600 mb-8">
+                {isCheckingAuth 
+                  ? 'Checking your login status...' 
+                  : 'Please wait while we map the site structure...'
+                }
+              </p>
             </div>
 
             {/* Progress bar */}
@@ -537,8 +750,10 @@ export default function AnalyzePage() {
             <div className="col-span-12 lg:col-span-5">
               <div className="bg-white/90 backdrop-blur-lg rounded-3xl shadow-2xl border border-white/20 h-[600px]">
                 <div className="p-6 border-b border-gray-200">
-                  <div className="flex items-center justify-between">
-                    <h3 className="text-xl font-bold text-gray-800">Site Structure Map</h3>
+                  <div className="flex items-center justify-between mb-4">
+                    <h3 className="text-xl font-bold text-gray-800">
+                      {viewMode === 'structure' ? 'Site Structure Map' : 'Network Map'}
+                    </h3>
                     <button
                       onClick={() => handleDownload()}
                       className="bg-gradient-to-r from-purple-500 to-blue-500 text-white text-sm font-medium py-2 px-4 rounded-xl hover:from-purple-600 hover:to-blue-600 transition-all shadow-lg hover:shadow-xl"
@@ -546,9 +761,45 @@ export default function AnalyzePage() {
                       Export Data
                     </button>
                   </div>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => setViewMode('structure')}
+                      className={`px-4 py-2 rounded-lg font-medium transition-colors text-sm ${
+                        viewMode === 'structure'
+                          ? 'bg-blue-600 text-white'
+                          : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                      }`}
+                    >
+                      📋 Structure Map
+                    </button>
+                    <button
+                      onClick={() => setViewMode('network')}
+                      className={`px-4 py-2 rounded-lg font-medium transition-colors text-sm ${
+                        viewMode === 'network'
+                          ? 'bg-blue-600 text-white'
+                          : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                      }`}
+                    >
+                      🌐 Network Map
+                    </button>
+                  </div>
                 </div>
                 <div className="p-4 overflow-y-auto h-[520px]">
-                  {siteMap.map(node => renderTreeNode(node))}
+                  {viewMode === 'structure' ? (
+                    <div>
+                      {siteMap.map(node => renderTreeNode(node))}
+                    </div>
+                  ) : (
+                    <div className="h-full">
+                      {result && result.networkData ? (
+                        <NetworkVisualization networkData={result.networkData} />
+                      ) : (
+                        <div className="flex items-center justify-center h-full text-gray-500">
+                          네트워크 데이터를 로드하는 중...
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
