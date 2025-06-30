@@ -11,6 +11,7 @@ export interface CrawlResult {
         text: string;
     }[];
     forms: number;
+    buttons: string[];
     textContent: string;
     screenshotPath: string;
     htmlPath: string;
@@ -21,20 +22,30 @@ export interface CrawlResult {
         linkCount: number;
     };
 }
+export interface NetworkNode {
+    id: string;
+    label: string;
+    color: string;
+    type: string;
+    url: string;
+    title: string;
+    screenshot: string;
+}
+export interface NetworkEdge {
+    from: string;
+    to: string;
+}
 export interface NetworkData {
-    nodes: Array<{
-        id: string;
-        label: string;
-        color: string;
-        type: string;
-        url: string;
-        title: string;
-        screenshot: string;
-    }>;
-    edges: Array<{
-        from: string;
-        to: string;
-    }>;
+    nodes: NetworkNode[];
+    edges: NetworkEdge[];
+}
+export interface AnalysisResult {
+    results: CrawlResult[];
+    networkData: NetworkData;
+    totalPages: number;
+    isPreview: boolean;
+    previewLimit: number;
+    message: string;
 }
 export declare class CrawlerService {
     private prisma;
@@ -43,10 +54,14 @@ export declare class CrawlerService {
     startCrawling(userId: number, targetUrl: string, maxPages?: number): Promise<string>;
     private performCrawling;
     private removeCookiePopups;
-    private extractPageData;
-    private classifyPageType;
+    private crawlSinglePage;
+    private extractLinks;
     private generateNetworkData;
-    private getColorByPageType;
+    private generateVisualizationHtml;
+    private sanitizeFilename;
+    private sleep;
+    private randomDelay;
+    private isSameDomain;
     getUserAnalyses(userId: number, limit?: number): Promise<{
         id: string;
         url: string;
@@ -71,12 +86,12 @@ export declare class CrawlerService {
         createdAt: Date;
         updatedAt: Date;
     }>;
-    getPreviewAnalysis(url: string): Promise<any>;
-    private crawlSinglePage;
+    getPreviewAnalysis(url: string): Promise<AnalysisResult>;
+    private performDFSCrawl;
     downloadFile(analysisId: string, userId: number, fileType: 'png' | 'html', pageId: string): Promise<{
         filePath: string;
         filename: string;
         contentType: string;
     }>;
-    private generateVisualizationHtml;
+    private detectSPANavigation;
 }

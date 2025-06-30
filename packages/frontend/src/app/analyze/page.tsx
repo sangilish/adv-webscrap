@@ -119,7 +119,7 @@ export default function AnalyzePage() {
   const [error, setError] = useState<string | null>(null)
   const [viewMode, setViewMode] = useState<ViewMode>('structure')
   const [result, setResult] = useState<AnalysisResult | null>(null)
-  const [isCheckingAuth, setIsCheckingAuth] = useState(true)
+  const [isCheckingAuth, setIsCheckingAuth] = useState(false)
 
   useEffect(() => {
     if (!url) {
@@ -127,42 +127,9 @@ export default function AnalyzePage() {
       return
     }
 
-    // 로그인 상태 확인
-    checkAuthStatus()
+    // 로그인 필요 없이 바로 미리보기 분석 시작
+    startAnalysis()
   }, [url, router])
-
-  const checkAuthStatus = async () => {
-    try {
-      const token = localStorage.getItem('token')
-      
-      if (!token) {
-        // 토큰이 없으면 로그인 페이지로 리다이렉트
-        router.push('/login?message=Please log in to analyze websites')
-        return
-      }
-
-      // 토큰 유효성 확인
-      const response = await fetch('/api/auth/profile', {
-        headers: {
-          'Authorization': `Bearer ${token}`
-        }
-      })
-
-      if (!response.ok) {
-        // 토큰이 유효하지 않으면 로그인 페이지로 리다이렉트
-        localStorage.removeItem('token')
-        router.push('/login?message=Session expired. Please log in again.')
-        return
-      }
-
-      // 로그인 상태가 확인되면 분석 시작
-      setIsCheckingAuth(false)
-      startAnalysis()
-    } catch (error) {
-      console.error('Auth check failed:', error)
-      router.push('/login?message=Authentication failed. Please log in.')
-    }
-  }
 
   const startAnalysis = async () => {
     try {
@@ -827,7 +794,10 @@ export default function AnalyzePage() {
                                 className="w-full max-h-96 object-contain rounded-lg mb-4"
                                 onError={(e) => {
                                   e.currentTarget.style.display = 'none'
-                                  e.currentTarget.nextElementSibling!.style.display = 'block'
+                                  const nextElement = e.currentTarget.nextElementSibling as HTMLElement
+                                  if (nextElement) {
+                                    nextElement.style.display = 'block'
+                                  }
                                 }}
                               />
                               <div style={{ display: 'none' }}>

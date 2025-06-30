@@ -1,6 +1,6 @@
 import { Injectable, Logger, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { chromium } from 'playwright';
+import { chromium, Browser, BrowserContext, Page } from 'playwright';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -25,20 +25,33 @@ export interface CrawlResult {
   };
 }
 
+export interface NetworkNode {
+  id: string;
+  label: string;
+  color: string;
+  type: string;
+  url: string;
+  title: string;
+  screenshot: string;
+}
+
+export interface NetworkEdge {
+  from: string;
+  to: string;
+}
+
 export interface NetworkData {
-  nodes: Array<{
-    id: string;
-    label: string;
-    color: string;
-    type: string;
-    url: string;
-    title: string;
-    screenshot: string;
-  }>;
-  edges: Array<{
-    from: string;
-    to: string;
-  }>;
+  nodes: NetworkNode[];
+  edges: NetworkEdge[];
+}
+
+export interface AnalysisResult {
+  results: CrawlResult[];
+  networkData: NetworkData;
+  totalPages: number;
+  isPreview: boolean;
+  previewLimit: number;
+  message: string;
 }
 
 @Injectable()
@@ -106,10 +119,10 @@ export class CrawlerService {
     const visitedUrls = new Set<string>();
     const baseUrl = new URL(startUrl).origin;
     
-    // 플랜별 페이지 제한
+    // 플랜별 페이지 제한 (FREE도 충분히 탐색 가능하도록 확대)
     const planLimits = {
-      FREE: 5,
-      PRO: 100,
+      FREE: 100,
+      PRO: 500,
       ENTERPRISE: 1000
     };
     
@@ -145,6 +158,8 @@ export class CrawlerService {
         this.logger.log(`Crawling: ${currentUrl} (${results.length + 1}/${actualMaxPages})`);
 
         const page = await context.newPage();
+        // 페이지 콘솔 에러 로깅
+        page.on('pageerror', (err) => this.logger.error('Page error:', err));
         
         try {
           // ChatGPT 분석 반영: networkidle 타임아웃 문제 해결
@@ -172,12 +187,26 @@ export class CrawlerService {
           console.log(`  - Content Length: ${pageContentLength} chars`);
           console.log(`  - Response Status: ${response?.status()}`);
 
-          // 쿠키 팝업 제거
-          await this.removeCookiePopups(page);
-          await page.waitForTimeout(1000);
+          // NEW: 고정 뷰포트 설정 (전체 페이지 스크린샷 안정화)
+          await page.setViewportSize({ width: 1280, height: 800 });
+
+          // SPA 네비게이션 탐지 (첫 번째 페이지에서만)
+          if (results.length === 0) {
+            console.log('🔍 Detecting SPA navigation patterns...');
+            const spaRoutes = await this.detectSPANavigation(page, baseUrl);
+            console.log(`🎯 Found ${spaRoutes.length} potential SPA routes`);
+            
+            // SPA 라우트를 크롤링 큐에 추가
+            for (const route of spaRoutes) {
+              if (!visitedUrls.has(route) && !urlsToVisit.includes(route)) {
+                urlsToVisit.push(route);
+                console.log(`➕ Added SPA route to queue: ${route}`);
+              }
+            }
+          }
 
           // 데이터 추출
-          const result = await this.extractPageData(page, currentUrl, analysisId, screenshotsDir, htmlDir);
+          const result = await this.crawlSinglePage(page, currentUrl, outputDir);
           results.push(result);
 
           // 진행률 업데이트
@@ -191,47 +220,7 @@ export class CrawlerService {
 
           // 같은 도메인의 새로운 링크 찾기
           if (results.length < actualMaxPages) {
-            const links = await page.evaluate(() => {
-              const allLinks = new Set<string>();
-              
-              // 1. 모든 앵커 태그 (Python 코드와 동일)
-              const anchors = document.querySelectorAll('a[href]');
-              for (const anchor of anchors) {
-                const href = (anchor as HTMLAnchorElement).href;
-                if (href && href.startsWith('http') && !href.includes('javascript:')) {
-                  allLinks.add(href);
-                }
-              }
-
-              // 2. 버튼의 onclick에서 location.href 추출 (Python 코드 방식)
-              const buttons = document.querySelectorAll('button');
-              for (const button of buttons) {
-                const onclick = button.getAttribute('onclick') || '';
-                const match = onclick.match(/location\.href\s*=\s*['"]([^'"]*)['"]/);
-                if (match && match[1] && match[1].startsWith('http')) {
-                  allLinks.add(match[1]);
-                }
-              }
-
-              // 3. 기타 클릭 가능한 요소들의 data 속성
-              const clickableElements = document.querySelectorAll('[data-href], [data-url], [onclick*="location"]');
-              for (const el of clickableElements) {
-                const dataHref = el.getAttribute('data-href') || 
-                                el.getAttribute('data-url') || '';
-                if (dataHref && dataHref.startsWith('http')) {
-                  allLinks.add(dataHref);
-                }
-                
-                // onclick에서 URL 추출
-                const onclick = el.getAttribute('onclick') || '';
-                const urlMatch = onclick.match(/(?:window\.location|location\.href)\s*=\s*['"]([^'"]+)['"]/);
-                if (urlMatch && urlMatch[1] && urlMatch[1].startsWith('http')) {
-                  allLinks.add(urlMatch[1]);
-                }
-              }
-
-              return Array.from(allLinks);
-            });
+            const links = await this.extractLinks(page);
             
             for (const link of links) {
               try {
@@ -252,7 +241,7 @@ export class CrawlerService {
       }
       
       // 네트워크 데이터 생성
-      const networkData = this.generateNetworkData(results);
+      const networkData = this.generateNetworkData(results, {});
       
       // 시각화 HTML 생성
       const visualizationHtml = this.generateVisualizationHtml(networkData, results);
@@ -405,706 +394,351 @@ export class CrawlerService {
     await page.waitForTimeout(2000);
   }
 
-  private async extractPageData(
-    page: any,
-    url: string,
-    analysisId: string,
-    screenshotsDir: string,
-    htmlDir: string,
-  ): Promise<CrawlResult> {
-    try {
-      // 페이지가 완전히 로드될 때까지 추가 대기
-      await page.waitForTimeout(5000);
+  private async crawlSinglePage(page: Page, url: string, outputDir: string): Promise<CrawlResult> {
+    const timestamp = new Date().toISOString();
+    const pageId = `page_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
-      // 더 공격적인 JavaScript 실행
-      await page.evaluate(() => {
-        // 모든 이벤트 리스너 트리거
-        const events = ['mouseover', 'mouseenter', 'focus', 'click'];
-        const allElements = document.querySelectorAll('*');
-        allElements.forEach(el => {
-          events.forEach(event => {
-            try {
-              const evt = new Event(event, { bubbles: true, cancelable: true });
-              el.dispatchEvent(evt);
-            } catch (e) {
-              // 무시
-            }
-          });
-        });
+    console.log(`🚀 페이지 로딩 시작: ${url}`);
+    
+    // Enable console logging from the page
+    page.on('console', msg => {
+      console.log(`[PAGE ${msg.type().toUpperCase()}] ${msg.text()}`);
+    });
+    
+    // Navigate to the page first!
+    await page.goto(url, { 
+      waitUntil: 'domcontentloaded', 
+      timeout: 30000 
+    });
 
-        // 모든 스크립트가 실행될 시간을 줌
-        return new Promise(resolve => setTimeout(resolve, 3000));
-      });
+    console.log(`📄 페이지 로드 완료, SPA 렌더링 대기 중...`);
 
-      await page.waitForTimeout(3000);
+    // Wait for the page to be fully interactive
+    await page.waitForLoadState('networkidle').catch(() => {
+      console.log('⚠️ 네트워크 idle 대기 실패, DOM 로드로 대체');
+      return page.waitForLoadState('domcontentloaded');
+    });
+    
+    // Give SPAs extra time to render - curated.media needs more time
+    console.log(`⏳ SPA 렌더링을 위해 5초 대기...`);
+    await page.waitForTimeout(5000);
 
-      // 페이지 제목
-      const title = await page.evaluate(() => {
-        return document.title || 
-               document.querySelector('h1')?.textContent || 
-               document.querySelector('title')?.textContent || 
-               'Untitled Page';
-      });
+    // Remove cookie popups only for full analysis (프리뷰에서는 생략)
+    const isPreviewRun = path.basename(outputDir).startsWith('preview_');
+    if (!isPreviewRun) {
+      console.log(`🍪 쿠키 팝업 및 오버레이 제거 중...`);
+      await this.removeCookiePopups(page);
+      await page.waitForTimeout(1000);
+    }
 
-      // Python 코드 방식의 링크 추출 - JavaScript evaluation 사용
-      const links = await page.evaluate(() => {
-        const allLinks = new Set<string>();
-        
-        // 1. 모든 앵커 태그 (Python 코드와 동일)
-        const anchors = document.querySelectorAll('a[href]');
-        for (const anchor of anchors) {
-          const href = (anchor as HTMLAnchorElement).href;
-          if (href && href.startsWith('http') && !href.includes('javascript:')) {
-            allLinks.add(href);
-          }
-        }
+    // Try to trigger any lazy-loaded content
+    console.log(`📜 스크롤하여 지연 로딩 컨텐츠 트리거...`);
+    await page.evaluate(() => {
+      // Scroll to trigger lazy loading
+      window.scrollTo(0, document.body.scrollHeight);
+      window.scrollTo(0, 0);
+    });
+    await page.waitForTimeout(2000);
 
-        // 2. 버튼의 onclick에서 location.href 추출 (Python 코드 방식)
-        const buttons = document.querySelectorAll('button');
-        for (const button of buttons) {
-          const onclick = button.getAttribute('onclick') || '';
-          const match = onclick.match(/location\.href\s*=\s*['"]([^'"]*)['"]/);
-          if (match && match[1] && match[1].startsWith('http')) {
-            allLinks.add(match[1]);
-          }
-        }
+    // Screenshot
+    const screenshotFilename = `${pageId}.png`;
+    const screenshotsDir = path.join(outputDir, 'screenshots');
+    if (!fs.existsSync(screenshotsDir)) {
+      fs.mkdirSync(screenshotsDir, { recursive: true });
+    }
+    const screenshotPath = path.join(screenshotsDir, screenshotFilename);
+    await page.screenshot({
+      path: screenshotPath,
+      fullPage: true,
+      type: 'png'
+    });
 
-        // 3. 기타 클릭 가능한 요소들의 data 속성
-        const clickableElements = document.querySelectorAll('[data-href], [data-url], [onclick*="location"]');
-        for (const el of clickableElements) {
-          const dataHref = el.getAttribute('data-href') || 
-                          el.getAttribute('data-url') || '';
-          if (dataHref && dataHref.startsWith('http')) {
-            allLinks.add(dataHref);
-          }
-          
-          // onclick에서 URL 추출
-          const onclick = el.getAttribute('onclick') || '';
-          const urlMatch = onclick.match(/(?:window\.location|location\.href)\s*=\s*['"]([^'"]+)['"]/);
-          if (urlMatch && urlMatch[1] && urlMatch[1].startsWith('http')) {
-            allLinks.add(urlMatch[1]);
-          }
-        }
+    // HTML content
+    const htmlContent = await page.content();
+    const htmlFilename = `${pageId}.html`;
+    const htmlDir = path.join(outputDir, 'html');
+    if (!fs.existsSync(htmlDir)) {
+      fs.mkdirSync(htmlDir, { recursive: true });
+    }
+    const htmlPath = path.join(htmlDir, htmlFilename);
+    await fs.promises.writeFile(htmlPath, htmlContent);
 
-        return Array.from(allLinks);
-      });
+    // Extract all possible navigation targets
+    console.log(`🔍 링크 추출 시작: ${url}`);
+    
+    const navigationData = await page.evaluate(() => {
+      const currentOrigin = location.origin;
 
-      // Python 코드 방식의 버튼/클릭 요소 추출
-      const buttons = await page.evaluate(() => {
-        const buttonTexts = new Set<string>();
-        
-        // 모든 가능한 클릭 가능한 요소들을 포괄적으로 수집
-        const selectors = [
-          'button', 'input[type="submit"]', 'input[type="button"]',
-          'a', '[role="button"]', '[onclick]', '[data-toggle]',
-          '.btn', '.button', '.nav-link', '.menu-item', '.tab',
-          '.dropdown-item', '.clickable', '.action-button',
-          'nav a', '.navbar a', '.menu a', '.navigation a',
-          '.header a', '.sidebar a', '.footer a', 'li a'
-        ];
+      // 1) 모든 a[href] 절대 URL 모으기
+      const rawLinks = Array.from(document.querySelectorAll('a[href]'))
+        .map(a => (a as HTMLAnchorElement).href.trim())
+        .filter(h => h &&
+                    !h.startsWith('javascript:') &&
+                    !h.startsWith('mailto:') &&
+                    !h.startsWith('tel:'));
 
-        for (const selector of selectors) {
-          try {
-            const elements = document.querySelectorAll(selector);
-            for (const el of elements) {
-              // 텍스트 추출 - 여러 속성에서 시도
-              const text = el.textContent?.trim() || 
-                          el.getAttribute('title') || 
-                          el.getAttribute('aria-label') || 
-                          el.getAttribute('alt') || 
-                          el.getAttribute('placeholder') || 
-                          el.getAttribute('value') || '';
-              
-              if (text && text.length > 0 && text.length < 100 && !text.includes('\n')) {
-                buttonTexts.add(text);
-              }
-            }
-          } catch (e) {
-            // 선택자 오류 무시
-          }
-        }
+      // 2) 같은 Origin 만 필터 & 중복 제거
+      const links = Array.from(new Set(
+        rawLinks.filter(h => {
+          try { return new URL(h).origin === currentOrigin; } catch { return false; }
+        })
+      ));
 
-        // 특별히 메뉴/네비게이션 아이템들 추가 수집
-        const menuItems = document.querySelectorAll('li, .menu-option, .nav-option, .sidebar-item, .dropdown-menu li');
-        for (const item of menuItems) {
-          const text = item.textContent?.trim();
-          if (text && text.length > 0 && text.length < 50 && 
-              (item.querySelector('a') || item.hasAttribute('onclick') || 
-               item.classList.contains('clickable'))) {
-            buttonTexts.add(text);
-          }
-        }
+      // 기본 페이지 메타 데이터
+      const images = Array.from(document.querySelectorAll('img[src]'))
+        .map(img => (img as HTMLImageElement).src)
+        .filter(src => src && !src.startsWith('data:'));
 
-        return Array.from(buttonTexts).filter(text => 
-          text.length > 0 && 
-          text.trim() !== '' &&
-          !text.match(/^\s*$/)
-        );
-      });
+      const headings = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6'))
+        .map(h => ({ level: h.tagName.toLowerCase(), text: h.textContent?.trim() || '' }))
+        .filter(h => h.text);
 
-      // 이미지 추출
-      const images = await page.evaluate(() => {
-        const imgs = Array.from(document.querySelectorAll('img[src]'));
-        return imgs.map(img => {
-          const src = (img as HTMLImageElement).src;
-          return src.startsWith('http') ? src : new URL(src, window.location.href).href;
-        }).filter(src => src && !src.includes('data:'));
-      });
-
-      // 헤딩 추출
-      const headings = await page.evaluate(() => {
-        const headingElements = document.querySelectorAll('h1, h2, h3, h4, h5, h6');
-        return Array.from(headingElements).map(h => ({
-          level: h.tagName.toLowerCase(),
-          text: h.textContent?.trim() || ''
-        })).filter(h => h.text.length > 0);
-      });
-
-      // 폼 개수
-      const forms = await page.evaluate(() => {
-        return document.querySelectorAll('form').length;
-      });
-
-      // 텍스트 콘텐츠
-      const textContent = await page.evaluate(() => {
-        // 스크립트, 스타일, 숨겨진 요소 제외하고 텍스트 추출
-        const walker = document.createTreeWalker(
-          document.body || document,
-          NodeFilter.SHOW_TEXT,
-          {
-            acceptNode: (node) => {
-              const parent = node.parentElement;
-              if (!parent) return NodeFilter.FILTER_REJECT;
-              
-              const style = window.getComputedStyle(parent);
-              if (style.display === 'none' || style.visibility === 'hidden') {
-                return NodeFilter.FILTER_REJECT;
-              }
-              
-              const tagName = parent.tagName.toLowerCase();
-              if (['script', 'style', 'noscript'].includes(tagName)) {
-                return NodeFilter.FILTER_REJECT;
-              }
-              
-              return NodeFilter.FILTER_ACCEPT;
-            }
-          }
-        );
-
-        let text = '';
-        let node;
-        while (node = walker.nextNode()) {
-          const content = node.textContent?.trim();
-          if (content && content.length > 0) {
-            text += content + ' ';
-          }
-        }
-        
-        return text.trim().substring(0, 5000); // 최대 5000자
-      });
-
-      // 페이지 타입 분류
-      const pageType = this.classifyPageType(url, title, headings, buttons);
-
-      // 고유 ID 생성
-      const pageId = `page_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-      
-      // 스크린샷 저장 (PNG에는 quality 옵션 불가)
-      const screenshotFilename = `${pageId}.png`;
-      const screenshotPath = path.join(screenshotsDir, screenshotFilename);
-      await page.screenshot({ 
-        path: screenshotPath, 
-        fullPage: true,
-        type: 'png'
-        // quality 제거 - PNG에서는 지원하지 않음
-      });
-
-      // HTML 저장
-      const htmlFilename = `${pageId}.html`;
-      const htmlPath = path.join(htmlDir, htmlFilename);
-      const htmlContent = await page.content();
-      await fs.promises.writeFile(htmlPath, htmlContent, 'utf8');
-
-      // 메타데이터 계산
-      const words = textContent.split(/\s+/).filter(word => word.length > 0);
-      
-      console.log(`📊 Page Analysis Results for ${url}:`);
-      console.log(`  - Title: ${title}`);
-      console.log(`  - Links found: ${links.length}`);
-      console.log(`  - Buttons found: ${buttons.length}`);
-      console.log(`  - Images found: ${images.length}`);
-      console.log(`  - Headings found: ${headings.length}`);
-      console.log(`  - Word count: ${words.length}`);
-      console.log(`  - First 5 buttons: ${buttons.slice(0, 5).join(', ')}`);
+      const forms = document.querySelectorAll('form').length;
+      const buttonTexts = Array.from(document.querySelectorAll('button,input[type="button"],input[type="submit"]'))
+        .map(btn => btn.textContent?.trim() || btn.getAttribute('value') || '')
+        .filter(t => t);
 
       return {
-        id: pageId,
-        url,
-        title,
-        pageType,
+        title: document.title || '',
         links,
+        allLinks: rawLinks,
         images,
         headings,
         forms,
-        buttons,
-        textContent,
-        screenshotPath: `/temp/${analysisId}/screenshots/${screenshotFilename}`,
-        htmlPath: `/temp/${analysisId}/html/${htmlFilename}`,
-        timestamp: new Date().toISOString(),
-        metadata: {
-          wordCount: words.length,
-          imageCount: images.length,
-          linkCount: links.length,
-        },
+        textContent: document.body?.innerText || '',
+        buttons: buttonTexts,
+        debugInfo: [] as any[]
       };
-    } catch (error) {
-      console.error(`Error extracting data from ${url}:`, error);
-      
-      // 오류 발생 시에도 기본 데이터 반환
-      const pageId = `page_${Date.now()}_error`;
-      return {
-        id: pageId,
-        url,
-        title: 'Error loading page',
-        pageType: 'error',
-        links: [],
-        images: [],
-        headings: [],
-        forms: 0,
-        buttons: [],
-        textContent: '',
-        screenshotPath: '',
-        htmlPath: '',
-        timestamp: new Date().toISOString(),
-        metadata: {
-          wordCount: 0,
-          imageCount: 0,
-          linkCount: 0,
-        },
-      };
-    }
-  }
+    });
 
-  private classifyPageType(url: string, title: string, headings: any[], buttons: string[]): string {
-    const urlLower = url.toLowerCase();
-    const titleLower = title.toLowerCase();
-    const allText = (title + ' ' + headings.map(h => h.text).join(' ') + ' ' + buttons.join(' ')).toLowerCase();
+    // Log debug information
+    console.log(`\n🔍 Link Extraction Debug for ${url}:`);
+    console.log(`Found ${navigationData.links.length} valid links`);
+    console.log(`Total links discovered: ${navigationData.allLinks ? navigationData.allLinks.length : 0}`);
     
-    // URL 패턴 기반 분류
-    if (urlLower.includes('/home') || urlLower === '/' || urlLower.match(/^https?:\/\/[^\/]+\/?$/)) {
-      return '홈페이지';
-    } else if (urlLower.includes('/about') || allText.includes('about') || allText.includes('회사소개')) {
-      return '회사소개';
-    } else if (urlLower.includes('/product') || urlLower.includes('/service') || allText.includes('제품') || allText.includes('서비스')) {
-      return '제품/서비스';
-    } else if (urlLower.includes('/blog') || urlLower.includes('/news') || allText.includes('블로그') || allText.includes('뉴스')) {
-      return '블로그/뉴스';
-    } else if (urlLower.includes('/contact') || allText.includes('contact') || allText.includes('연락처')) {
-      return '연락처';
-    } else if (urlLower.includes('/dashboard') || allText.includes('dashboard') || allText.includes('대시보드')) {
-      return '대시보드';
-    } else if (urlLower.includes('/pricing') || allText.includes('pricing') || allText.includes('요금')) {
-      return '요금제';
-    } else if (urlLower.includes('/login') || urlLower.includes('/signin') || allText.includes('로그인')) {
-      return '로그인';
-    } else if (urlLower.includes('/signup') || urlLower.includes('/register') || allText.includes('회원가입')) {
-      return '회원가입';
-    } else if (urlLower.includes('/portfolio') || allText.includes('portfolio') || allText.includes('포트폴리오')) {
-      return '포트폴리오';
-    } else if (urlLower.includes('/team') || allText.includes('team') || allText.includes('팀')) {
-      return '팀 소개';
-    } else if (urlLower.includes('/faq') || allText.includes('faq') || allText.includes('자주묻는질문')) {
-      return 'FAQ';
-    } else if (urlLower.includes('/support') || allText.includes('support') || allText.includes('지원')) {
-      return '고객지원';
-    } else {
-      // 메인 헤딩과 버튼을 기반으로 분류
-      const mainHeading = headings.find(h => h.level === 'h1')?.text || title;
-      const mainButtons = buttons.slice(0, 3).join(', ');
-      
-      if (mainButtons) {
-        return `${mainHeading.slice(0, 20)}... (${mainButtons})`;
-      } else {
-        return mainHeading.slice(0, 30) || '일반 페이지';
+    // Temporary: Add debug info to textContent for inspection
+    let debugText = `\n\n=== DEBUG INFO ===\n`;
+    debugText += `Total links found: ${navigationData.links.length}\n`;
+    debugText += `All links discovered: ${navigationData.allLinks ? navigationData.allLinks.length : 0}\n`;
+    debugText += `Debug entries: ${navigationData.debugInfo ? navigationData.debugInfo.length : 0}\n`;
+    
+    if (navigationData.allLinks) {
+      debugText += `\nAll discovered links:\n`;
+      navigationData.allLinks.slice(0, 10).forEach(link => debugText += `  - ${link}\n`);
+      if (navigationData.allLinks.length > 10) {
+        debugText += `  ... and ${navigationData.allLinks.length - 10} more\n`;
       }
     }
-  }
-
-  private generateNetworkData(results: CrawlResult[]): NetworkData {
-    const nodes = results.map(result => ({
-      id: result.id,
-      label: result.title || 'Untitled',
-      color: this.getColorByPageType(result.pageType),
-      type: result.pageType,
-      url: result.url,
-      title: result.title,
-      screenshot: result.screenshotPath
-    }));
-
-    const edges: Array<{ from: string; to: string }> = [];
     
-    // 링크 관계 생성
-    results.forEach(fromResult => {
-      fromResult.links.forEach(link => {
-        const toResult = results.find(r => r.url === link);
-        if (toResult && fromResult.id !== toResult.id) {
-          edges.push({
-            from: fromResult.id,
-            to: toResult.id
-          });
-        }
+    if (navigationData.debugInfo) {
+      const accepted = navigationData.debugInfo.filter(d => d.accepted);
+      const rejected = navigationData.debugInfo.filter(d => !d.accepted);
+      
+      debugText += `\nAccepted: ${accepted.length} links\n`;
+      accepted.slice(0, 5).forEach(d => debugText += `  - ${d.url} (${d.source})\n`);
+      
+      debugText += `\nRejected: ${rejected.length} links\n`;
+      const rejectionReasons = rejected.reduce((acc, d) => {
+        acc[d.rejected] = (acc[d.rejected] || 0) + 1;
+        return acc;
+      }, {} as Record<string, number>);
+      
+      Object.entries(rejectionReasons).forEach(([reason, count]) => {
+        debugText += `  - ${reason}: ${count} links\n`;
       });
-    });
-
-    return { nodes, edges };
-  }
-
-  private getColorByPageType(pageType: string): string {
-    const colors = {
-      homepage: '#FF6B6B',
-      about: '#4ECDC4', 
-      contact: '#45B7D1',
-      product: '#96CEB4',
-      blog: '#FFEAA7',
-      page: '#DDA0DD'
-    };
-    return colors[pageType] || colors.page;
-  }
-
-  // 사용자별 분석 조회 (Free 유저는 5개만)
-  async getUserAnalyses(userId: number, limit?: number) {
-    const user = await this.prisma.user.findUnique({
-      where: { id: userId }
-    });
-
-    const actualLimit = user?.plan === 'FREE' ? 5 : (limit || 50);
-
-    return this.prisma.analysis.findMany({
-      where: { userId },
-      orderBy: { createdAt: 'desc' },
-      take: actualLimit,
-      select: {
-        id: true,
-        url: true,
-        title: true,
-        status: true,
-        pageCount: true,
-        progress: true,
-        createdAt: true,
-        updatedAt: true
-      }
-    });
-  }
-
-  // 분석 상세 조회
-  async getAnalysis(analysisId: string, userId: number) {
-    const analysis = await this.prisma.analysis.findFirst({
-      where: { 
-        id: analysisId, 
-        userId 
-      }
-    });
-
-    if (!analysis) {
-      throw new BadRequestException('Analysis not found');
+      
+      // Add first few rejected links for inspection
+      debugText += `\nFirst few rejected:\n`;
+      rejected.slice(0, 5).forEach(d => debugText += `  - ${d.url} (${d.rejected}, ${d.source})\n`);
+    }
+    
+    // Append debug info to textContent temporarily
+    navigationData.textContent += debugText;
+    
+    if (navigationData.debugInfo) {
+      const accepted = navigationData.debugInfo.filter(d => d.accepted);
+      const rejected = navigationData.debugInfo.filter(d => !d.accepted);
+      
+      console.log(`✅ Accepted: ${accepted.length} links`);
+      accepted.slice(0, 5).forEach(d => console.log(`  - ${d.url} (${d.source})`));
+      
+      console.log(`❌ Rejected: ${rejected.length} links`);
+      const rejectionReasons = rejected.reduce((acc, d) => {
+        acc[d.rejected] = (acc[d.rejected] || 0) + 1;
+        return acc;
+      }, {} as Record<string, number>);
+      
+      Object.entries(rejectionReasons).forEach(([reason, count]) => {
+        console.log(`  - ${reason}: ${count} links`);
+      });
     }
 
-    return {
-      ...analysis,
-      resultData: analysis.resultData ? JSON.parse(analysis.resultData) : null
+         // Page type classification
+     let pageType = '일반페이지';
+     const pathname = new URL(url).pathname.toLowerCase();
+     const titleLower = navigationData.title.toLowerCase();
+     
+     if (pathname === '/' || pathname === '/home' || titleLower.includes('home')) {
+       pageType = '홈페이지';
+     } else if (pathname.includes('about') || titleLower.includes('about')) {
+       pageType = '소개페이지';
+     } else if (pathname.includes('contact') || titleLower.includes('contact')) {
+       pageType = '연락처';
+     } else if (pathname.includes('product') || titleLower.includes('product')) {
+       pageType = '제품페이지';
+     } else if (pathname.includes('service') || titleLower.includes('service')) {
+       pageType = '서비스페이지';
+     } else if (pathname.includes('dashboard') || titleLower.includes('dashboard')) {
+       pageType = '대시보드';
+     }
+
+    const isPreview = path.basename(outputDir).startsWith('preview_');
+    const screenshotUrl = isPreview
+      ? `/temp/${path.basename(outputDir)}/screenshots/${screenshotFilename}`
+      : `/uploads/${path.basename(outputDir)}/screenshots/${screenshotFilename}`;
+    const htmlUrl = isPreview
+      ? `/temp/${path.basename(outputDir)}/html/${htmlFilename}`
+      : `/uploads/${path.basename(outputDir)}/html/${htmlFilename}`;
+
+    // Add debugging info
+    console.log(`📊 Navigation data:`, {
+      title: navigationData.title,
+      linksFound: navigationData.links.length,
+      debugEntries: navigationData.debugInfo?.length || 0
+    });
+    
+    const result: CrawlResult = {
+      id: pageId,
+      url,
+      title: `${navigationData.title} [LINKS: ${navigationData.links.length}]`,
+      pageType,
+      links: navigationData.links,
+      images: navigationData.images,
+      headings: navigationData.headings,
+      forms: navigationData.forms,
+      buttons: navigationData.buttons,
+      textContent: navigationData.textContent + `\n\n=== DEBUG ===\nLinks found: ${navigationData.links.length}\nDebug entries: ${navigationData.debugInfo?.length || 0}`,
+      screenshotPath: screenshotUrl,
+      htmlPath: htmlUrl,
+      timestamp,
+      metadata: {
+        wordCount: navigationData.textContent.split(/\s+/).length,
+        imageCount: navigationData.images.length,
+        linkCount: navigationData.links.length
+      }
     };
+
+    return result;
   }
 
-  // 무료 미리보기 (로그인 없이 5개 페이지만)
-  async getPreviewAnalysis(url: string): Promise<any> {
-    console.log('Starting preview analysis for:', url);
+  private async extractLinks(page: Page): Promise<string[]> {
+    const base = new URL(page.url()).origin;
+
+    // 1) 메뉴(사이드바)가 렌더될 때까지 기다리기
+    await page.waitForSelector('nav, .sidebar, [role="menu"]', { timeout: 5000 }).catch(() => {});
+
+    // 2) 모든 <a> 태그의 절대 URL
+    const anchors = await page.$$eval('a[href]', els =>
+      els
+        .map(a => (a as HTMLAnchorElement).href)
+        .filter(href => href.startsWith(window.location.origin) &&
+                        !/(javascript:|mailto:|tel:)/.test(href) &&
+                        !/\.(css|js|png|jpg|jpeg|gif|svg|ico|pdf|zip|mp4|mp3)([?#]|$)/i.test(href))
+    );
+
+    // 3) onclick 속성으로 네비게이션 하는 버튼
+    const btns = await page.$$eval('button[onclick]', els =>
+      els
+        .map(b => {
+          const m = b.getAttribute('onclick')?.match(/location\.href\s*=\s*['"]([^'"]+)['"]/);
+          return m ? new URL(m[1], window.location.href).href : null;
+        })
+        .filter((u): u is string => !!u && u.startsWith(window.location.origin))
+    );
+
+    // 4) data-href / data-url 속성
+    const dataLinks = await page.$$eval('[data-href],[data-url]', els =>
+      els
+        .map(el => el.getAttribute('data-href') || el.getAttribute('data-url'))
+        .map(url => url ? new URL(url, window.location.href).href : null)
+        .filter((u): u is string => !!u && u.startsWith(window.location.origin))
+    );
+
+    // 5) 실제 클릭으로 라우팅되는 링크 (SPA)
+    const clickItems = await page.$$('nav button, nav li, [role="menuitem"]');
+    const clickLinks: string[] = [];
+    for (const item of clickItems) {
+      try {
+        const before = page.url();
+        await item.click();
+        await page.waitForLoadState('networkidle');
+        const after = page.url();
+        if (after !== before && after.startsWith(base)) {
+          clickLinks.push(after);
+        }
+        // 뒤로 돌아가기
+        await page.goBack({ waitUntil: 'networkidle' });
+      } catch {
+        // 클릭 실패해도 무시
+      } finally {
+        await page.waitForTimeout(500);
+      }
+    }
+
+    // 6) 모두 합쳐서 중복 제거
+    const all = [...anchors, ...btns, ...dataLinks, ...clickLinks];
+    return Array.from(new Set(all));
+  }
+
+  private generateNetworkData(results: CrawlResult[], sitemap: Record<string, string[]>): NetworkData {
+    const nodes: NetworkNode[] = [];
+    const edges: NetworkEdge[] = [];
+    const processedUrls = new Set<string>();
     
-    const tempId = `preview_${Date.now()}`;
-    const tempDir = path.join(process.cwd(), 'temp', tempId);
-    const screenshotsDir = path.join(tempDir, 'screenshots');
-    const htmlDir = path.join(tempDir, 'html');
-    
-    await fs.promises.mkdir(screenshotsDir, { recursive: true });
-    await fs.promises.mkdir(htmlDir, { recursive: true });
-
-    console.log('Temp directories created:', { tempDir, screenshotsDir, htmlDir });
-
-    const browser = await chromium.launch({ 
-      headless: true
-    });
-    
-    const context = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-      viewport: { width: 1400, height: 900 }
-    });
-
-    console.log('Browser launched successfully');
-
-    try {
-      const results: CrawlResult[] = [];
-      const visitedUrls = new Set<string>();
-      const baseUrl = new URL(url).origin;
-      
-      // 첫 번째 페이지 (메인 페이지) 크롤링
-      await this.crawlSinglePage(context, url, tempId, screenshotsDir, htmlDir, results, visitedUrls);
-      
-      // 메인 페이지에서 찾은 모든 링크 수집
-      const mainPageResult = results[0];
-      if (mainPageResult && mainPageResult.links) {
-        console.log(`Found ${mainPageResult.links.length} total links on main page`);
+    results.forEach((result, index) => {
+      if (!processedUrls.has(result.url)) {
+        processedUrls.add(result.url);
         
-        // 같은 도메인의 모든 링크 필터링 (더 관대한 필터링)
-        const sameDomainLinks = mainPageResult.links
-          .filter(link => {
-            try {
-              const linkUrl = new URL(link);
-              return linkUrl.origin === baseUrl && 
-                     !visitedUrls.has(link) &&
-                     !link.includes('#') &&
-                     !link.match(/\.(pdf|jpg|jpeg|png|gif|zip|doc|docx|css|js)$/i) &&
-                     !link.includes('mailto:') &&
-                     !link.includes('tel:');
-            } catch {
-              return false;
-            }
-          })
-          .slice(0, 15); // 최대 15개 페이지
-
-        console.log(`Filtered to ${sameDomainLinks.length} valid same-domain links:`, sameDomainLinks);
-
-        // 각 링크 페이지 크롤링
-        for (const link of sameDomainLinks) {
-          if (results.length >= 10) break; // 총 10페이지 제한 (무료 버전)
-          
-          try {
-            console.log(`Crawling additional page: ${link}`);
-            await this.crawlSinglePage(context, link, tempId, screenshotsDir, htmlDir, results, visitedUrls);
-            console.log(`Successfully crawled: ${link}`);
-            await new Promise(resolve => setTimeout(resolve, 2000)); // 2초 대기
-          } catch (error) {
-            console.error(`Failed to crawl ${link}:`, error);
-          }
+        // Determine node color based on page type
+        let color = '#6366f1'; // Default purple
+        switch (result.pageType) {
+          case '홈페이지': color = '#ef4444'; break;
+          case '소개페이지': color = '#10b981'; break;
+          case '연락처': color = '#f59e0b'; break;
+          case '제품페이지': color = '#8b5cf6'; break;
+          case '서비스페이지': color = '#06b6d4'; break;
+          case '대시보드': color = '#ec4899'; break;
         }
-      }
-
-      console.log(`Preview analysis completed. Total pages: ${results.length}`);
-
-      // 네트워크 데이터 생성
-      const networkData = this.generateNetworkData(results);
-
-      // 정상적인 크롤링 결과 반환
-      return {
-        results,
-        networkData,
-        totalPages: results.length,
-        isPreview: true,
-        previewLimit: 10,
-        freeDepthLimit: 'all_pages',
-        message: `무료 미리보기로 ${results.length}개 페이지를 분석했습니다. 전체 사이트맵과 더 깊은 분석을 원하시면 유료 플랜을 이용해주세요.`
-      };
-
-    } catch (error) {
-      console.error('Preview analysis failed:', error);
-      
-      // Mock 데이터 반환
-      return {
-        results: [
-          {
-            id: `page_${Date.now()}_main`,
-            url,
-            title: 'Curated.Media - Self-Service Programmatic Media Curation',
-            pageType: '대시보드',
-            links: [
-              'https://www.curated.media/supply-trends',
-              'https://www.curated.media/custom-media-curation',
-              'https://www.curated.media/audit-request',
-              'https://www.curated.media/pmp-request',
-              'https://www.curated.media/closed-loop-optimization',
-              'https://www.curated.media/upload-dsp-reporting',
-              'https://www.curated.media/pmp-library',
-              'https://www.curated.media/audience-segment',
-              'https://www.curated.media/contextual',
-              'https://www.curated.media/domain-scoring',
-              'https://www.curated.media/ctv-packages',
-              'https://www.curated.media/performance',
-              'https://www.curated.media/sensitive-categories',
-              'https://www.curated.media/analytics',
-              'https://www.curated.media/creatives',
-              'https://www.curated.media/book-demo',
-              'https://www.curated.media/contact-us',
-              'https://www.curated.media/documentation',
-              'https://www.curated.media/live-chat'
-            ],
-            images: [],
-            buttons: [
-              'Supply Trends',
-              'Custom Media Curation',
-              'Audit Request',
-              'PMP Request',
-              'Closed-Loop Optimization',
-              'Upload DSP Reporting',
-              'PMP Library',
-              'Audience Segment',
-              'Contextual',
-              'Domain Scoring',
-              'CTV Packages',
-              'Performance',
-              'Sensitive Categories',
-              'Added Value',
-              'Analytics',
-              'Creatives',
-              'Help',
-              'Book a Demo',
-              'Contact Us',
-              'Documentation',
-              'Live Chat',
-              'Get a Live Demo',
-              'Book a Platform Demo',
-              'Follow Us On LinkedIn',
-              'Follow'
-            ],
-            headings: [
-              { level: 'h1', text: 'Curated.Media' },
-              { level: 'h2', text: 'Top Performing Publishers' },
-              { level: 'h3', text: 'New Feature Releases' },
-              { level: 'h3', text: 'Live Demo' },
-              { level: 'h3', text: 'Trending Added Value' }
-            ],
-            forms: 2,
-            textContent: 'Curated.Media dashboard with various media curation tools and analytics',
-            screenshotPath: `/temp/${tempId}/screenshots/page_${Date.now()}_main.png`,
-            htmlPath: `/temp/${tempId}/html/page_${Date.now()}_main.html`,
-            timestamp: new Date().toISOString(),
-            metadata: {
-              wordCount: 150,
-              imageCount: 5,
-              linkCount: 19
-            }
-          }
-        ],
-        networkData: {
-          nodes: [
-            {
-              id: 'main',
-              label: 'Curated.Media Dashboard',
-              color: '#3B82F6',
-              type: '대시보드',
-              url: url,
-              title: 'Curated.Media - Self-Service Programmatic Media Curation',
-              screenshot: `/temp/${tempId}/screenshots/page_${Date.now()}_main.png`
-            }
-          ],
-          edges: []
-        },
-        totalPages: 1,
-        isPreview: true,
-        previewLimit: 10,
-        message: '이 사이트는 bot 방지 기능으로 인해 자동 크롤링이 제한됩니다. 위의 정보는 사이트 구조를 기반으로 한 예상 결과입니다.',
-        note: 'Curated.Media는 다음과 같은 주요 메뉴들을 제공합니다: Supply Trends, Custom Media Curation, PMP Library, Analytics 등'
-      };
-    } finally {
-      await browser.close();
-    }
-  }
-
-  private async crawlSinglePage(
-    context: any,
-    url: string,
-    tempId: string,
-    screenshotsDir: string,
-    htmlDir: string,
-    results: CrawlResult[],
-    visitedUrls: Set<string>
-  ): Promise<void> {
-    if (visitedUrls.has(url)) {
-      return;
-    }
-
-    visitedUrls.add(url);
-    console.log(`Crawling page: ${url}`);
-
-    const page = await context.newPage();
-    
-    try {
-      // ChatGPT 분석 반영: networkidle 타임아웃 문제 해결
-      console.log(`🔍 Loading page: ${url}`);
-      const response = await page.goto(url, { 
-        waitUntil: 'domcontentloaded', 
-        timeout: 30000 
-      });
-
-      // 응답 상태 확인
-      if (!response || !response.ok()) {
-        console.log(`❌ Page load failed with status: ${response?.status()}`);
-        return;
-      }
-
-      // Curated.media WebSocket/SSE 지속 대응: networkidle 대신 DOM 로드 후 대기
-      await page.waitForTimeout(3000);
-      console.log(`✅ Page loaded and ready: ${url}`);
-
-      // 디버깅: 페이지 내용 확인
-      const pageTitle = await page.title();
-      const pageContentLength = (await page.content()).length;
-      console.log(`📊 Page Debug Info:`);
-      console.log(`  - Title: "${pageTitle}"`);
-      console.log(`  - Content Length: ${pageContentLength} chars`);
-      console.log(`  - Response Status: ${response?.status()}`);
-
-      // 쿠키 팝업 제거
-      await this.removeCookiePopups(page);
-      await page.waitForTimeout(1000);
-
-      // 데이터 추출
-      const result = await this.extractPageData(page, url, tempId, screenshotsDir, htmlDir);
-      results.push(result);
-      
-      console.log(`✅ Successfully crawled: ${url}`);
-      console.log(`   📊 Links: ${result.links.length}, Buttons: ${result.buttons.length}`);
-      
-    } catch (error) {
-      console.error(`❌ Failed to crawl ${url}:`, error);
-    } finally {
-      await page.close();
-    }
-  }
-
-  // 파일 다운로드 (로그인 필요)
-  async downloadFile(analysisId: string, userId: number, fileType: 'png' | 'html', pageId: string) {
-    const analysis = await this.prisma.analysis.findFirst({
-      where: { 
-        id: analysisId, 
-        userId,
-        status: 'completed'
+        
+        nodes.push({
+          id: result.id,
+          label: result.title.substring(0, 20) + (result.title.length > 20 ? '...' : ''),
+          color,
+          type: result.pageType,
+          url: result.url,
+          title: result.title,
+          screenshot: result.screenshotPath
+        });
       }
     });
-
-    if (!analysis) {
-      throw new BadRequestException('Analysis not found or not completed');
-    }
-
-    const resultData = analysis.resultData ? JSON.parse(analysis.resultData) : null;
-    if (!resultData?.results) {
-      throw new BadRequestException('No results found');
-    }
-
-    const page = resultData.results.find(r => r.id === pageId);
-    if (!page) {
-      throw new BadRequestException('Page not found');
-    }
-
-    const filePath = fileType === 'png' ? page.screenshotPath : page.htmlPath;
-    const fullPath = path.join(process.cwd(), filePath.replace('/uploads/', 'uploads/'));
-
-    if (!fs.existsSync(fullPath)) {
-      throw new BadRequestException('File not found');
-    }
-
-    return {
-      filePath: fullPath,
-      filename: path.basename(fullPath),
-      contentType: fileType === 'png' ? 'image/png' : 'text/html'
-    };
+    
+    // Generate edges from sitemap
+    Object.entries(sitemap).forEach(([parentUrl, childUrls]) => {
+      const parentResult = results.find(r => r.url === parentUrl);
+      if (parentResult) {
+        childUrls.forEach(childUrl => {
+          const childResult = results.find(r => r.url === childUrl);
+          if (childResult) {
+            edges.push({
+              from: parentResult.id,
+              to: childResult.id
+            });
+          }
+        });
+      }
+    });
+    
+    return { nodes, edges };
   }
 
   private generateVisualizationHtml(networkData: NetworkData, results: CrawlResult[]): string {
@@ -1155,5 +789,440 @@ export class CrawlerService {
     </script>
 </body>
 </html>`;
+  }
+
+  // 유틸리티 함수들
+  private sanitizeFilename(url: string): string {
+    return url.replace(/[^0-9a-zA-Z]+/g, '_').slice(0, 200);
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  private randomDelay(min: number = 1000, max: number = 3000): number {
+    return Math.random() * (max - min) + min;
+  }
+
+  private isSameDomain(url: string, baseUrl: string): boolean {
+    try {
+      const urlObj = new URL(url);
+      const baseUrlObj = new URL(baseUrl);
+      return urlObj.hostname === baseUrlObj.hostname;
+    } catch {
+      return false;
+    }
+  }
+
+  // 사용자별 분석 조회 (Free 유저는 5개만)
+  async getUserAnalyses(userId: number, limit?: number) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId }
+    });
+
+    const actualLimit = user?.plan === 'FREE' ? 5 : (limit || 50);
+
+    return this.prisma.analysis.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'desc' },
+      take: actualLimit,
+      select: {
+        id: true,
+        url: true,
+        title: true,
+        status: true,
+        pageCount: true,
+        progress: true,
+        createdAt: true,
+        updatedAt: true
+      }
+    });
+  }
+
+  // 분석 상세 조회
+  async getAnalysis(analysisId: string, userId: number) {
+    const analysis = await this.prisma.analysis.findFirst({
+      where: { 
+        id: analysisId, 
+        userId 
+      }
+    });
+
+    if (!analysis) {
+      throw new BadRequestException('Analysis not found');
+    }
+
+    return {
+      ...analysis,
+      resultData: analysis.resultData ? JSON.parse(analysis.resultData) : null
+    };
+  }
+
+  // 무료 미리보기 (로그인 없이 5개 페이지만)
+  async getPreviewAnalysis(url: string): Promise<AnalysisResult> {
+    this.logger.log(`Starting preview analysis for: ${url}`);
+    
+    try {
+      // Validate URL
+      new URL(url);
+      
+      // Perform DFS crawl with preview limits
+      const { results, sitemap } = await this.performDFSCrawl(url, 2, 5); // depth=2, max=5 pages for preview
+      
+      // Generate network data
+      const networkData = this.generateNetworkData(results, sitemap);
+      
+      return {
+        results,
+        networkData,
+        totalPages: results.length,
+        isPreview: true,
+        previewLimit: 5,
+        message: `미리보기로 ${results.length}개 페이지를 분석했습니다. 전체 분석을 원하시면 로그인해주세요.`
+      };
+      
+    } catch (error) {
+      this.logger.error(`Preview analysis failed for ${url}:`, error);
+      throw error;
+    }
+  }
+
+  private async performDFSCrawl(
+    startUrl: string, 
+    maxDepth: number = 3, 
+    maxPages: number = 5
+  ): Promise<{ results: CrawlResult[], sitemap: Record<string, string[]> }> {
+    
+    // Create output directory
+    const timestamp = Date.now();
+    const outputDir = path.join(process.cwd(), 'temp', `preview_${timestamp}`);
+    if (!fs.existsSync(outputDir)) {
+      fs.mkdirSync(outputDir, { recursive: true });
+    }
+    
+    let browser: Browser | null = null;
+    let context: BrowserContext | null = null;
+    
+    try {
+      // Launch browser
+      browser = await chromium.launch({ 
+        headless: true,
+        args: ['--no-sandbox', '--disable-dev-shm-usage']
+      });
+      
+      context = await browser.newContext({
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        viewport: { width: 1400, height: 900 }
+      });
+      
+      const page = await context.newPage();
+      
+      const visited = new Set<string>();
+      const sitemap: Record<string, string[]> = {};
+      const results: CrawlResult[] = [];
+      
+      // DFS crawling function
+      const dfs = async (url: string, depth: number): Promise<void> => {
+        if (depth > maxDepth || visited.has(url) || results.length >= maxPages) {
+          this.logger.log(`⏭️  Skipping ${url} - depth:${depth}/${maxDepth}, visited:${visited.has(url)}, results:${results.length}/${maxPages}`);
+          return;
+        }
+        
+        this.logger.log(`🔍 [DEPTH ${depth}] Starting crawl: ${url}`);
+        visited.add(url);
+        
+        try {
+          // Navigate to the page
+          await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          await page.waitForTimeout(3000);
+          
+          // SPA 네비게이션 탐지 (첫 번째 페이지에서만)
+          if (depth === 0) {
+            console.log('🔍 Detecting SPA navigation patterns...');
+            const spaRoutes = await this.detectSPANavigation(page, new URL(startUrl).origin);
+            console.log(`🎯 Found ${spaRoutes.length} potential SPA routes`);
+            
+            // SPA 라우트를 방문 목록에 추가
+            for (const route of spaRoutes) {
+              if (!visited.has(route)) {
+                visited.add(route);
+                console.log(`➕ Added SPA route: ${route}`);
+              }
+            }
+          }
+          
+          const result = await this.crawlSinglePage(page, url, outputDir);
+          results.push(result);
+          
+          this.logger.log(`✅ [DEPTH ${depth}] Crawled successfully: ${url} (found ${result.links.length} links)`);
+          
+          // Filter same-domain links
+          const childLinks = result.links.filter(link => this.isSameDomain(link, startUrl));
+          sitemap[url] = childLinks;
+          
+          this.logger.log(`🔗 [DEPTH ${depth}] Same-domain child links: ${childLinks.length}`);
+          childLinks.forEach((link, index) => {
+            this.logger.log(`   ${index + 1}. ${link}`);
+          });
+          
+          // Recursively crawl child links
+          for (const childUrl of childLinks) {
+            if (results.length >= maxPages) {
+              this.logger.log(`🛑 Reached max pages limit (${maxPages})`);
+              break;
+            }
+            
+            if (!visited.has(childUrl)) {
+              this.logger.log(`⏳ [DEPTH ${depth}] Preparing to crawl child: ${childUrl}`);
+              
+              // Random delay between requests
+              const delay = this.randomDelay(1000, 3000);
+              this.logger.log(`⏰ Waiting ${Math.round(delay)}ms before next crawl...`);
+              await this.sleep(delay);
+              
+              await dfs(childUrl, depth + 1);
+            } else {
+              this.logger.log(`⏭️  Already visited: ${childUrl}`);
+            }
+          }
+          
+        } catch (error) {
+          this.logger.warn(`❌ [DEPTH ${depth}] Failed to crawl ${url}: ${error.message}`);
+          sitemap[url] = [];
+        }
+      };
+      
+      // Start DFS from root URL
+      await dfs(startUrl, 0);
+      
+      // Save sitemap
+      const sitemapPath = path.join(outputDir, 'sitemap.json');
+      fs.writeFileSync(sitemapPath, JSON.stringify(sitemap, null, 2));
+      
+      this.logger.log(`Crawl finished - ${results.length} pages crawled`);
+      
+      return { results, sitemap };
+      
+    } finally {
+      if (context) await context.close();
+      if (browser) await browser.close();
+    }
+  }
+
+  // 파일 다운로드 (로그인 필요)
+  async downloadFile(analysisId: string, userId: number, fileType: 'png' | 'html', pageId: string) {
+    const analysis = await this.prisma.analysis.findFirst({
+      where: { 
+        id: analysisId, 
+        userId,
+        status: 'completed'
+      }
+    });
+
+    if (!analysis) {
+      throw new BadRequestException('Analysis not found or not completed');
+    }
+
+    const resultData = analysis.resultData ? JSON.parse(analysis.resultData) : null;
+    if (!resultData?.results) {
+      throw new BadRequestException('No results found');
+    }
+
+    const page = resultData.results.find(r => r.id === pageId);
+    if (!page) {
+      throw new BadRequestException('Page not found');
+    }
+
+    const filePath = fileType === 'png' ? page.screenshotPath : page.htmlPath;
+    const fullPath = path.join(process.cwd(), filePath.replace('/uploads/', 'uploads/'));
+
+    if (!fs.existsSync(fullPath)) {
+      throw new BadRequestException('File not found');
+    }
+
+    return {
+      filePath: fullPath,
+      filename: path.basename(fullPath),
+      contentType: fileType === 'png' ? 'image/png' : 'text/html'
+    };
+  }
+
+  // Add SPA detection method
+  private async detectSPANavigation(page: Page, baseUrl: string): Promise<string[]> {
+    const discoveredUrls = new Set<string>();
+    
+    console.log('🔍 Detecting SPA navigation patterns...');
+    
+    // Method 1: Intercept navigation requests
+    page.on('request', request => {
+      const url = request.url();
+      const resourceType = request.resourceType();
+      
+      // Look for API calls that might indicate routes
+      if ((resourceType === 'xhr' || resourceType === 'fetch') && url.startsWith(baseUrl)) {
+        console.log(`🌐 Detected API call: ${url}`);
+        
+        // Extract potential routes from API paths
+        try {
+          const urlObj = new URL(url);
+          const pathSegments = urlObj.pathname.split('/').filter(s => s);
+          
+          // Common patterns: /api/pages/*, /api/*/list, etc.
+          if (pathSegments.includes('pages') || pathSegments.includes('routes')) {
+            discoveredUrls.add(url);
+          }
+        } catch (e) {
+          // Invalid URL
+        }
+      }
+    });
+    
+    // Method 2: Monitor for client-side route changes
+    await page.evaluate(() => {
+      // Intercept History API
+      const originalPushState = history.pushState;
+      const originalReplaceState = history.replaceState;
+      
+      history.pushState = function(...args) {
+        console.log('🔀 pushState:', args[2]);
+        window.postMessage({ type: 'navigation', url: args[2] }, '*');
+        return originalPushState.apply(history, args);
+      };
+      
+      history.replaceState = function(...args) {
+        console.log('🔀 replaceState:', args[2]);
+        window.postMessage({ type: 'navigation', url: args[2] }, '*');
+        return originalReplaceState.apply(history, args);
+      };
+    });
+    
+    // Listen for navigation messages
+    await page.exposeFunction('onNavigation', (url: string) => {
+      if (url && url.startsWith('/')) {
+        discoveredUrls.add(new URL(url, baseUrl).href);
+      }
+    });
+    
+    await page.evaluate(() => {
+      window.addEventListener('message', (e) => {
+        if (e.data.type === 'navigation' && e.data.url) {
+          (window as any).onNavigation(e.data.url);
+        }
+      });
+    });
+    
+    // Method 3: Extract routes from JavaScript
+    const jsRoutes = await page.evaluate(() => {
+      const routes = new Set<string>();
+      
+      // Look for Next.js routes
+      if ((window as any).__NEXT_DATA__) {
+        const nextData = (window as any).__NEXT_DATA__;
+        console.log('🔷 Found Next.js data:', nextData);
+        
+        // Extract page paths
+        if (nextData.page) routes.add(nextData.page);
+        if (nextData.props?.pageProps?.href) routes.add(nextData.props.pageProps.href);
+        
+        // Look for route manifest
+        if (nextData.runtimeConfig?.routes) {
+          Object.values(nextData.runtimeConfig.routes).forEach((route: any) => {
+            if (typeof route === 'string') routes.add(route);
+          });
+        }
+      }
+      
+      // Look for React Router
+      if ((window as any).__reactRouterVersion) {
+        console.log('⚛️ Found React Router');
+        
+        // Try to find route configuration
+        const routerElements = document.querySelectorAll('[data-route], [data-path]');
+        routerElements.forEach(el => {
+          const route = el.getAttribute('data-route') || el.getAttribute('data-path');
+          if (route) routes.add(route);
+        });
+      }
+      
+      // Look for Vue Router
+      if ((window as any).$nuxt || (window as any).__VUE__) {
+        console.log('🟢 Found Vue/Nuxt');
+        
+        // Extract routes from Vue Router
+        try {
+          const app = (window as any).__VUE__ || (window as any).$nuxt;
+          if (app.$router && app.$router.options && app.$router.options.routes) {
+            app.$router.options.routes.forEach((route: any) => {
+              if (route.path) routes.add(route.path);
+            });
+          }
+        } catch (e) {
+          console.error('Error extracting Vue routes:', e);
+        }
+      }
+      
+      return Array.from(routes);
+    });
+    
+    jsRoutes.forEach(route => {
+      try {
+        const fullUrl = new URL(route, baseUrl);
+        discoveredUrls.add(fullUrl.href);
+      } catch (e) {
+        // Invalid URL
+      }
+    });
+    
+    // Method 4: Click on navigation elements
+    const navSelectors = [
+      'nav a',
+      'nav button',
+      '[role="navigation"] a',
+      '[role="navigation"] button',
+      '.nav-link',
+      '.nav-item',
+      'a[class*="nav"]',
+      'button[class*="nav"]',
+      '[data-testid*="nav"]',
+      '[aria-label*="navigation"]'
+    ];
+    
+    for (const selector of navSelectors) {
+      const elements = await page.$$(selector);
+      console.log(`🖱️ Found ${elements.length} elements matching ${selector}`);
+      
+      for (const element of elements.slice(0, 5)) { // Limit to prevent too many clicks
+        try {
+          const isVisible = await element.isVisible();
+          if (!isVisible) continue;
+          
+          const beforeUrl = page.url();
+          
+          // Hover first (might trigger dropdowns)
+          await element.hover();
+          await page.waitForTimeout(500);
+          
+          // Try to click
+          await element.click({ timeout: 2000 });
+          await page.waitForTimeout(1000);
+          
+          const afterUrl = page.url();
+          if (afterUrl !== beforeUrl && afterUrl.startsWith(baseUrl)) {
+            discoveredUrls.add(afterUrl);
+            console.log(`✅ Discovered via click: ${afterUrl}`);
+            
+            // Go back
+            await page.goBack({ waitUntil: 'domcontentloaded' });
+          }
+        } catch (e) {
+          // Click failed, continue
+        }
+      }
+    }
+    
+    console.log(`🎯 Found ${discoveredUrls.size} potential SPA routes`);
+    discoveredUrls.forEach((route, i) => console.log(`  ${i + 1}. ${route}`));
+    
+    return Array.from(discoveredUrls);
   }
 }

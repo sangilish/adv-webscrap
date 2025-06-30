@@ -5,7 +5,7 @@ export declare class CrawlerController {
     private crawlerService;
     private prisma;
     constructor(crawlerService: CrawlerService, prisma: PrismaService);
-    getPreview(url: string, response: Response): Promise<any>;
+    getPreview(url: string, response: Response): Promise<import("./crawler.service").AnalysisResult>;
     startCrawling(req: any, body: {
         url: string;
         maxPages?: number;
