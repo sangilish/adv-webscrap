@@ -13,10 +13,22 @@ export class AuthController {
     return this.authService.signIn(signInDto.email, signInDto.password);
   }
 
+  @HttpCode(HttpStatus.OK)
+  @Post('login/supabase')
+  signInWithSupabase(@Body() signInDto: Record<string, any>) {
+    return this.authService.signInWithSupabase(signInDto.email, signInDto.password);
+  }
+
   @HttpCode(HttpStatus.CREATED)
   @Post('signup')
   signUp(@Body() signUpDto: Record<string, any>) {
     return this.authService.signUp(signUpDto.email, signUpDto.password);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Post('logout')
+  signOut(@Request() req) {
+    return this.authService.signOut(req.user.sub);
   }
 
   @UseGuards(JwtAuthGuard)

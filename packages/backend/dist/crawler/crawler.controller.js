@@ -32,18 +32,34 @@ let CrawlerController = class CrawlerController {
         response.header('Access-Control-Allow-Methods', 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS');
         response.header('Access-Control-Allow-Headers', 'Content-Type, Accept, Authorization');
         if (!url) {
+            console.log('No URL provided');
             throw new common_1.BadRequestException('URL is required');
         }
         try {
             new URL(url);
+            console.log('URL validation passed');
         }
         catch (error) {
+            console.log('URL validation failed:', error.message);
             throw new common_1.BadRequestException('Invalid URL format');
         }
-        console.log('Calling crawlerService.getPreviewAnalysis...');
-        const result = await this.crawlerService.getPreviewAnalysis(url);
-        console.log('Service returned:', result);
-        return result;
+        try {
+            console.log('Calling crawlerService.getPreviewAnalysis...');
+            const result = await this.crawlerService.getPreviewAnalysis(url);
+            console.log('Service returned result with', result.results.length, 'pages');
+            return result;
+        }
+        catch (error) {
+            console.error('Error in getPreviewAnalysis:', error);
+            return {
+                results: [],
+                networkData: { nodes: [], edges: [] },
+                totalPages: 0,
+                isPreview: true,
+                previewLimit: 30,
+                message: `크롤링 중 오류가 발생했습니다: ${error.message}`
+            };
+        }
     }
     async startCrawling(req, body) {
         const { url, maxPages = 5 } = body;
@@ -103,9 +119,34 @@ let CrawlerController = class CrawlerController {
         const imagePath = `temp/${tempId}/screenshots/${filename}`;
         const fullPath = require('path').join(process.cwd(), imagePath);
         if (!fs.existsSync(fullPath)) {
+            console.error('Screenshot not found at path:', fullPath);
             throw new common_1.BadRequestException('Screenshot not found');
         }
         res.sendFile(fullPath);
+    }
+    async getPageDetails(url, response) {
+        console.log('Page details endpoint called with URL:', url);
+        response.header('Access-Control-Allow-Origin', 'http://localhost:3000');
+        response.header('Access-Control-Allow-Credentials', 'true');
+        response.header('Access-Control-Allow-Methods', 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS');
+        response.header('Access-Control-Allow-Headers', 'Content-Type, Accept, Authorization');
+        if (!url) {
+            throw new common_1.BadRequestException('URL is required');
+        }
+        try {
+            new URL(url);
+        }
+        catch (error) {
+            throw new common_1.BadRequestException('Invalid URL format');
+        }
+        try {
+            const result = await this.crawlerService.getPageDetails(url);
+            return result;
+        }
+        catch (error) {
+            console.error('Error in getPageDetails:', error);
+            throw new common_1.BadRequestException(`페이지 상세 정보를 가져오는 중 오류가 발생했습니다: ${error.message}`);
+        }
     }
 };
 exports.CrawlerController = CrawlerController;
@@ -183,6 +224,14 @@ __decorate([
     __metadata("design:paramtypes", [String, String, Object]),
     __metadata("design:returntype", Promise)
 ], CrawlerController.prototype, "getTempScreenshot", null);
+__decorate([
+    (0, common_1.Post)('page-details'),
+    __param(0, (0, common_1.Body)('url')),
+    __param(1, (0, common_1.Res)({ passthrough: true })),
+    __metadata("design:type", Function),
+    __metadata("design:paramtypes", [String, Object]),
+    __metadata("design:returntype", Promise)
+], CrawlerController.prototype, "getPageDetails", null);
 exports.CrawlerController = CrawlerController = __decorate([
     (0, common_1.Controller)('crawler'),
     __metadata("design:paramtypes", [crawler_service_1.CrawlerService,

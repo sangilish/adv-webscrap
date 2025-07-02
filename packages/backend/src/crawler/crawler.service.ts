@@ -1,5 +1,6 @@
 import { Injectable, Logger, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { SupabaseService } from '../supabase/supabase.service';
 import { chromium, Browser, BrowserContext, Page } from 'playwright';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -62,12 +63,16 @@ export interface AnalysisResult {
 export class CrawlerService {
   private readonly logger = new Logger(CrawlerService.name);
 
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private supabaseService: SupabaseService
+  ) {}
 
   async startCrawling(
     userId: number,
     targetUrl: string,
     maxPages: number = 5,
+    supabaseUserId?: string,
   ): Promise<string> {
     // 사용자 플랜 확인
     const user = await this.prisma.user.findUnique({
@@ -77,6 +82,16 @@ export class CrawlerService {
 
     if (!user) {
       throw new BadRequestException('User not found');
+    }
+
+    // Supabase에서도 유저 프로필 확인
+    let supabaseProfile = null;
+    if (supabaseUserId) {
+      try {
+        supabaseProfile = await this.supabaseService.getUserProfile(supabaseUserId);
+      } catch (error) {
+        this.logger.warn('Supabase profile not found:', error.message);
+      }
     }
 
     // Free 플랜 제한 확인 (월 10개)
@@ -92,7 +107,7 @@ export class CrawlerService {
       throw new BadRequestException('Monthly crawling limit reached. Please upgrade to Pro.');
     }
 
-    // 분석 레코드 생성
+    // 분석 레코드 생성 (Prisma)
     const analysis = await this.prisma.analysis.create({
       data: {
         userId,
@@ -101,13 +116,41 @@ export class CrawlerService {
       },
     });
 
+    // Supabase에도 분석 데이터 저장
+    let supabaseAnalysis: any = null;
+    if (supabaseUserId) {
+      try {
+        supabaseAnalysis = await this.supabaseService.saveAnalysis(supabaseUserId, {
+          url: targetUrl,
+          status: 'running',
+          progress: 0
+        });
+      } catch (error) {
+        this.logger.warn('Failed to save analysis to Supabase:', error.message);
+      }
+    }
+
     // 백그라운드에서 크롤링 실행
-    this.performOptimizedCrawling(analysis.id, targetUrl, maxPages, user.plan).catch((error) => {
+    this.performOptimizedCrawling(
+      analysis.id, 
+      targetUrl, 
+      maxPages, 
+      user.plan,
+      supabaseUserId,
+      supabaseAnalysis?.id
+    ).catch((error) => {
       this.logger.error(`Crawling failed for analysis ${analysis.id}:`, error);
       this.prisma.analysis.update({
         where: { id: analysis.id },
         data: { status: 'failed' },
       });
+      
+      // Supabase 분석도 실패로 업데이트
+      if (supabaseUserId && supabaseAnalysis?.id) {
+        this.supabaseService.updateAnalysis(supabaseAnalysis.id, {
+          status: 'failed'
+        }).catch(err => this.logger.warn('Failed to update Supabase analysis status:', err.message));
+      }
     });
 
     return analysis.id;
@@ -118,6 +161,8 @@ export class CrawlerService {
     startUrl: string,
     maxPages: number,
     userPlan: string,
+    supabaseUserId?: string,
+    supabaseAnalysisId?: string,
   ): Promise<void> {
     const startTime = Date.now();
     const results: CrawlResult[] = [];
@@ -167,7 +212,7 @@ export class CrawlerService {
       const htmlPath = path.join(outputDir, 'visualization.html');
       await fs.promises.writeFile(htmlPath, visualizationHtml);
 
-      // Update analysis
+      // Update analysis (Prisma)
       await this.prisma.analysis.update({
         where: { id: analysisId },
         data: {
@@ -177,6 +222,28 @@ export class CrawlerService {
           title: results[0]?.title || 'Website Analysis'
         },
       });
+
+      // Update Supabase analysis
+      if (supabaseUserId && supabaseAnalysisId) {
+        try {
+          await this.supabaseService.updateAnalysis(supabaseAnalysisId, {
+            status: 'completed',
+            page_count: results.length,
+            progress: 100,
+            title: results[0]?.title || 'Website Analysis',
+            resultData: {
+              results,
+              networkData,
+              totalPages: results.length,
+              isPreview: false,
+              message: `Successfully crawled ${results.length} pages`
+            },
+            html_path: htmlPath
+          });
+        } catch (error) {
+          this.logger.warn('Failed to update Supabase analysis:', error.message);
+        }
+      }
 
       const duration = (Date.now() - startTime) / 1000;
       this.logger.log(`✅ Crawling completed in ${duration}s. ${results.length} pages crawled.`);
@@ -647,7 +714,7 @@ export class CrawlerService {
           
           // 결과 객체 생성 (스크린샷/HTML 경로는 빈 문자열)
           const result: CrawlResult = {
-            id: `preview_${Date.now()}_${allResults.length}`,
+            id: `preview_${Date.now()}_${allResults.length}_depth${depth}`,
             url: pageUrl,
             title: pageData.title,
             pageType: this.classifyPageType(pageUrl, pageData.title),

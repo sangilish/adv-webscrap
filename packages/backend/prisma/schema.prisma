@@ -25,10 +25,16 @@ model User {
   subscriptionEndsAt DateTime?
   lastResetDate DateTime @default(now()) // 마지막 월별 리셋 날짜
   
+  // 크레딧 시스템
+  credits   Int @default(0) // 현재 보유 크레딧 (10페이지 = 1달러 = 100크레딧, 1페이지 = 10크레딧)
+  totalCreditsEarned Int @default(0) // 총 구매한 크레딧
+  totalCreditsUsed   Int @default(0) // 총 사용한 크레딧
+  
   // 관계
   analyses  Analysis[]
   payments  Payment[]
   downloads Download[]
+  creditTransactions CreditTransaction[]
   
   @@map("users")
 }
@@ -44,6 +50,7 @@ model Analysis {
   resultData  String?  // JSON 형태로 저장
   screenshotPath String?
   htmlPath    String?
+  creditsUsed Int      @default(0) // 이 분석에서 사용된 크레딧
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
   
@@ -58,11 +65,12 @@ model Payment {
   id              String   @id @default(cuid())
   userId          Int
   stripeSessionId String   @unique
-  amount          Int      // 원 단위
-  currency        String   @default("KRW")
+  amount          Int      // 센트 단위 (USD)
+  currency        String   @default("USD")
   status          String   @default("pending") // "pending", "completed", "failed"
-  type            String   // "additional_pages", "subscription"
+  type            String   // "credits", "subscription"
   description     String?
+  creditsGranted  Int      @default(0) // 이 결제로 제공된 크레딧 수
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
   
@@ -70,6 +78,23 @@ model Payment {
   user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   
   @@map("payments")
+}
+
+model CreditTransaction {
+  id          String   @id @default(cuid())
+  userId      Int
+  type        String   // "purchase", "usage", "refund", "bonus"
+  amount      Int      // 양수: 크레딧 증가, 음수: 크레딧 감소
+  balanceAfter Int     // 거래 후 잔액
+  description String?
+  paymentId   String?  // Payment와 연결 (선택사항)
+  analysisId  String?  // Analysis와 연결 (선택사항)
+  createdAt   DateTime @default(now())
+  
+  // 관계
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@map("credit_transactions")
 }
 
 model Download {

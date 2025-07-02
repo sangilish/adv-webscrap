@@ -28,6 +28,7 @@
     "@playwright/browser-chromium": "^1.53.1",
     "@playwright/test": "^1.53.1",
     "@prisma/client": "^6.10.1",
+    "@supabase/supabase-js": "^2.50.2",
     "bcrypt": "^6.0.0",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.14.2",
@@ -37,8 +38,10 @@
     "passport": "^0.7.0",
     "passport-jwt": "^4.0.1",
     "playwright": "^1.53.1",
+    "postgres": "^3.4.7",
     "reflect-metadata": "^0.2.2",
-    "rxjs": "^7.8.1"
+    "rxjs": "^7.8.1",
+    "stripe": "^18.3.0"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3.2.0",

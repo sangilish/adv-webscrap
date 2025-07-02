@@ -10,7 +10,7 @@ export async function POST(request: Request) {
 
     const body = await request.json()
 
-    const response = await fetch('http://localhost:3003/crawler/start', {
+    const response = await fetch('http://localhost:3001/crawler/start', {
       method: 'POST',
       headers: {
         'Authorization': authHeader,

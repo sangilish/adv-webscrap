@@ -1,14 +1,16 @@
-export const runtime = 'nodejs'
+import { NextRequest, NextResponse } from 'next/server';
 
-export async function GET(request: Request) {
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:3003';
+
+export async function GET(request: NextRequest) {
   try {
     const authHeader = request.headers.get('Authorization')
     
     if (!authHeader) {
-      return Response.json({ error: 'Authorization header required' }, { status: 401 })
+      return NextResponse.json({ error: 'Authorization header required' }, { status: 401 })
     }
 
-    const response = await fetch('http://localhost:3003/auth/profile', {
+    const response = await fetch(`${BACKEND_URL}/auth/profile`, {
       method: 'GET',
       headers: {
         'Authorization': authHeader,
@@ -18,9 +20,9 @@ export async function GET(request: Request) {
 
     const data = await response.json()
     
-    return Response.json(data, { status: response.status })
+    return NextResponse.json(data, { status: response.status })
   } catch (error) {
     console.error('Auth profile proxy error:', error)
-    return Response.json({ error: 'Internal server error' }, { status: 500 })
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 } 

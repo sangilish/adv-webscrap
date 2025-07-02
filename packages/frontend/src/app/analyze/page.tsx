@@ -459,113 +459,339 @@ export default function AnalyzePage() {
   }
 
   const NetworkVisualization = ({ networkData }: { networkData: NetworkData }) => {
+    const [zoom, setZoom] = useState(1)
+    const [panX, setPanX] = useState(0)
+    const [panY, setPanY] = useState(0)
+    const [isDragging, setIsDragging] = useState(false)
+    const [dragStart, setDragStart] = useState({ x: 0, y: 0 })
+
     useEffect(() => {
       if (!networkData?.nodes?.length) return
 
       const container = document.getElementById('network-container')
       if (!container) return
 
-      // Force layout 계산
-      const nodes = networkData.nodes.map((node, index) => ({
-        ...node,
-        x: 400 + Math.cos(index * 2 * Math.PI / networkData.nodes.length) * 150,
-        y: 300 + Math.sin(index * 2 * Math.PI / networkData.nodes.length) * 150,
-        vx: 0,
-        vy: 0
-      }))
+      // 노드를 depth별로 그룹화
+      const nodesByDepth = networkData.nodes.reduce((acc, node) => {
+        // ID에서 depth 정보 추출: preview_timestamp_index_depthN
+        const depthMatch = node.id.match(/depth(\d+)/)
+        const depth = depthMatch ? parseInt(depthMatch[1]) : 0
+        if (!acc[depth]) acc[depth] = []
+        acc[depth].push(node)
+        return acc
+      }, {} as Record<number, typeof networkData.nodes>)
 
-      // SVG 생성
-      const svgWidth = 800
-      const svgHeight = 600
+      const maxDepth = Math.max(...Object.keys(nodesByDepth).map(Number))
+      const svgWidth = Math.max(1200, (maxDepth + 1) * 300) // 왼쪽에서 오른쪽으로 더 넓게
+      const svgHeight = 800
+      
+      // 왼쪽에서 오른쪽으로 계층적 레이아웃 계산 (수평 배치)
+      const nodes = networkData.nodes.map(node => {
+        const depthMatch = node.id.match(/depth(\d+)/)
+        const depth = depthMatch ? parseInt(depthMatch[1]) : 0
+        const nodesAtDepth = nodesByDepth[depth]
+        const indexAtDepth = nodesAtDepth.indexOf(node)
+        const totalAtDepth = nodesAtDepth.length
+        
+        // 각 depth별로 세로로 균등 배치, depth는 가로로 배치
+        const x = 150 + depth * 280 // depth별로 가로로 배치 (왼쪽에서 오른쪽)
+        const y = (svgHeight / (totalAtDepth + 1)) * (indexAtDepth + 1) // 세로로 균등 배치
+        
+        return {
+          ...node,
+          x,
+          y,
+          depth
+        }
+      })
       
       container.innerHTML = `
-        <div class="bg-white border rounded-lg p-6">
-          <h3 class="text-lg font-semibold mb-4">웹사이트 네트워크 구조</h3>
-          <svg width="${svgWidth}" height="${svgHeight}" style="border: 1px solid #e5e7eb; background: #f9fafb;">
-            <defs>
-              <marker id="arrowhead" markerWidth="10" markerHeight="7" 
-                      refX="9" refY="3.5" orient="auto">
-                <polygon points="0 0, 10 3.5, 0 7" fill="#666" />
-              </marker>
-              <filter id="drop-shadow">
-                <feDropShadow dx="2" dy="2" stdDeviation="3" flood-opacity="0.3"/>
-              </filter>
-            </defs>
+        <div class="bg-white border rounded-lg overflow-hidden">
+          <!-- 네트워크 맵 헤더 -->
+          <div class="p-4 border-b bg-gray-50 flex justify-between items-center">
+            <h3 class="text-lg font-semibold">웹사이트 계층 구조 (왼쪽→오른쪽)</h3>
             
-            ${networkData.edges.map(edge => {
-              const fromNode = nodes.find(n => n.id === edge.from)
-              const toNode = nodes.find(n => n.id === edge.to)
-              if (!fromNode || !toNode) return ''
-              
-              return `
-                <line x1="${fromNode.x}" y1="${fromNode.y}" x2="${toNode.x}" y2="${toNode.y}" 
-                      stroke="#94a3b8" stroke-width="2" marker-end="url(#arrowhead)" opacity="0.7" />
-              `
-            }).join('')}
-            
-            ${nodes.map((node, index) => {
-              return `
-                <g class="node-group" data-id="${node.id}" style="cursor: pointer;">
-                  <circle cx="${node.x}" cy="${node.y}" r="40" 
-                          fill="${node.color}" 
-                          stroke="#ffffff" 
-                          stroke-width="3" 
-                          filter="url(#drop-shadow)" />
-                  <text x="${node.x}" y="${node.y - 5}" 
-                        text-anchor="middle" 
-                        fill="white" 
-                        font-size="10" 
-                        font-weight="bold">
-                    ${node.type}
-                  </text>
-                  <text x="${node.x}" y="${node.y + 8}" 
-                        text-anchor="middle" 
-                        fill="white" 
-                        font-size="8">
-                    페이지 ${index + 1}
-                  </text>
-                  <text x="${node.x}" y="${node.y + 65}" 
-                        text-anchor="middle" 
-                        fill="#374151" 
-                        font-size="11" 
-                        font-weight="500"
-                        style="max-width: 100px;">
-                    ${node.label.length > 25 ? node.label.substring(0, 25) + '...' : node.label}
-                  </text>
-                </g>
-              `
-            }).join('')}
-          </svg>
-          
-          <div class="mt-6 grid grid-cols-1 md:grid-cols-2 gap-4">
+            <!-- 컨트롤 버튼들 -->
+            <div class="flex items-center gap-2">
+              <button id="zoom-in" class="p-2 bg-blue-500 text-white rounded hover:bg-blue-600 transition-colors" title="확대">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"></path>
+                </svg>
+              </button>
+              <button id="zoom-out" class="p-2 bg-blue-500 text-white rounded hover:bg-blue-600 transition-colors" title="축소">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18 12H6"></path>
+                </svg>
+              </button>
+              <button id="reset-view" class="p-2 bg-gray-500 text-white rounded hover:bg-gray-600 transition-colors" title="초기화">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                </svg>
+              </button>
+              <span class="text-sm text-gray-600 ml-2">${Math.round(zoom * 100)}%</span>
+            </div>
+          </div>
+
+          <!-- 스크롤 가능한 네트워크 맵 영역 -->
+          <div class="relative">
+            <div id="network-viewport" class="overflow-auto" style="height: 400px; cursor: grab;">
+              <svg id="network-svg" width="${svgWidth}" height="${svgHeight}" 
+                   style="background: linear-gradient(to right, #f8fafc, #f1f5f9); min-width: ${svgWidth}px;">
+                <defs>
+                  <marker id="arrowhead" markerWidth="10" markerHeight="7" 
+                          refX="9" refY="3.5" orient="auto">
+                    <polygon points="0 0, 10 3.5, 0 7" fill="#666" />
+                  </marker>
+                  <filter id="drop-shadow">
+                    <feDropShadow dx="2" dy="2" stdDeviation="3" flood-opacity="0.3"/>
+                  </filter>
+                  <linearGradient id="depth0" x1="0%" y1="0%" x2="100%" y2="100%">
+                    <stop offset="0%" style="stop-color:#ef4444;stop-opacity:1" />
+                    <stop offset="100%" style="stop-color:#dc2626;stop-opacity:1" />
+                  </linearGradient>
+                  <linearGradient id="depth1" x1="0%" y1="0%" x2="100%" y2="100%">
+                    <stop offset="0%" style="stop-color:#f97316;stop-opacity:1" />
+                    <stop offset="100%" style="stop-color:#ea580c;stop-opacity:1" />
+                  </linearGradient>
+                  <linearGradient id="depth2" x1="0%" y1="0%" x2="100%" y2="100%">
+                    <stop offset="0%" style="stop-color:#eab308;stop-opacity:1" />
+                    <stop offset="100%" style="stop-color:#ca8a04;stop-opacity:1" />
+                  </linearGradient>
+                  <linearGradient id="depth3" x1="0%" y1="0%" x2="100%" y2="100%">
+                    <stop offset="0%" style="stop-color:#22c55e;stop-opacity:1" />
+                    <stop offset="100%" style="stop-color:#16a34a;stop-opacity:1" />
+                  </linearGradient>
+                  <linearGradient id="depth4" x1="0%" y1="0%" x2="100%" y2="100%">
+                    <stop offset="0%" style="stop-color:#3b82f6;stop-opacity:1" />
+                    <stop offset="100%" style="stop-color:#2563eb;stop-opacity:1" />
+                  </linearGradient>
+                </defs>
+                
+                <!-- Depth 레이블 및 구분선 (세로선) -->
+                ${Array.from({length: maxDepth + 1}, (_, depth) => `
+                  <g>
+                    <line x1="${150 + depth * 280 - 50}" y1="0" x2="${150 + depth * 280 - 50}" y2="${svgHeight}" 
+                          stroke="#e5e7eb" stroke-width="1" stroke-dasharray="5,5" opacity="0.5" />
+                    <rect x="${150 + depth * 280 - 90}" y="20" width="80" height="25" 
+                          fill="rgba(255,255,255,0.9)" stroke="#d1d5db" rx="12" />
+                    <text x="${150 + depth * 280 - 50}" y="37" 
+                          text-anchor="middle" 
+                          fill="#374151" 
+                          font-size="12" 
+                          font-weight="600">
+                      Depth ${depth}
+                    </text>
+                  </g>
+                `).join('')}
+                
+                <!-- 연결선 -->
+                ${networkData.edges.map(edge => {
+                  const fromNode = nodes.find(n => n.id === edge.from)
+                  const toNode = nodes.find(n => n.id === edge.to)
+                  if (!fromNode || !toNode) return ''
+                  
+                  return `
+                    <line x1="${fromNode.x + 35}" y1="${fromNode.y}" x2="${toNode.x - 35}" y2="${toNode.y}" 
+                          stroke="#94a3b8" stroke-width="2" marker-end="url(#arrowhead)" opacity="0.6" />
+                  `
+                }).join('')}
+                
+                <!-- 노드 -->
+                ${nodes.map((node, index) => {
+                  const depthColor = `depth${Math.min(node.depth, 4)}`
+                  return `
+                    <g class="node-group" data-id="${node.id}" style="cursor: pointer;" 
+                       onmouseover="this.style.transform='scale(1.1)'" 
+                       onmouseout="this.style.transform='scale(1)'">
+                      <circle cx="${node.x}" cy="${node.y}" r="35" 
+                              fill="url(#${depthColor})" 
+                              stroke="#ffffff" 
+                              stroke-width="3" 
+                              filter="url(#drop-shadow)" />
+                      <text x="${node.x}" y="${node.y - 8}" 
+                            text-anchor="middle" 
+                            fill="white" 
+                            font-size="10" 
+                            font-weight="bold">
+                        ${node.type}
+                      </text>
+                      <text x="${node.x}" y="${node.y + 6}" 
+                            text-anchor="middle" 
+                            fill="white" 
+                            font-size="8">
+                        D${node.depth}
+                      </text>
+                      <text x="${node.x}" y="${node.y + 55}" 
+                            text-anchor="middle" 
+                            fill="#374151" 
+                            font-size="10" 
+                            font-weight="500"
+                            style="max-width: 120px;">
+                        ${node.label.length > 20 ? node.label.substring(0, 20) + '...' : node.label}
+                      </text>
+                    </g>
+                  `
+                }).join('')}
+              </svg>
+            </div>
+          </div>
+        </div>
+        
+        <!-- 고정된 분석 섹션 -->
+        <div class="mt-4 bg-white border rounded-lg p-4">
+          <h4 class="font-semibold text-gray-900 mb-3">분석 통계</h4>
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div class="bg-gray-50 p-4 rounded">
-              <h4 class="font-medium text-gray-900 mb-2">노드 정보</h4>
-              <div class="space-y-2 text-sm">
-                ${nodes.map(node => `
-                  <div class="flex items-center gap-2">
-                    <div class="w-3 h-3 rounded-full" style="background-color: ${node.color}"></div>
-                    <span class="text-gray-700">${node.type}: ${node.label}</span>
+              <h5 class="font-medium text-gray-900 mb-2">계층 통계</h5>
+              <div class="space-y-1 text-sm text-gray-700">
+                <div>최대 깊이: ${maxDepth}단계</div>
+                <div>총 노드: ${nodes.length}개</div>
+                <div>총 연결: ${networkData.edges.length}개</div>
+              </div>
+            </div>
+            
+            <div class="bg-gray-50 p-4 rounded">
+              <h5 class="font-medium text-gray-900 mb-2">Depth별 분포</h5>
+              <div class="space-y-1 text-sm">
+                ${Object.entries(nodesByDepth).map(([depth, depthNodes]) => `
+                  <div class="flex items-center justify-between">
+                    <span class="text-gray-700">Depth ${depth}:</span>
+                    <span class="font-medium">${depthNodes.length}개</span>
                   </div>
                 `).join('')}
               </div>
             </div>
             
             <div class="bg-gray-50 p-4 rounded">
-              <h4 class="font-medium text-gray-900 mb-2">연결 통계</h4>
-              <div class="space-y-1 text-sm text-gray-700">
-                <div>총 노드: ${nodes.length}개</div>
-                <div>총 연결: ${networkData.edges.length}개</div>
-                <div>연결 밀도: ${networkData.edges.length > 0 ? ((networkData.edges.length / (nodes.length * (nodes.length - 1))) * 100).toFixed(1) : 0}%</div>
+              <h5 class="font-medium text-gray-900 mb-2">페이지 유형</h5>
+              <div class="space-y-1 text-sm">
+                ${Object.entries(nodes.reduce((acc, node) => {
+                  acc[node.type] = (acc[node.type] || 0) + 1
+                  return acc
+                }, {} as Record<string, number>)).map(([type, count]) => `
+                  <div class="flex items-center justify-between">
+                    <span class="text-gray-700">${type}:</span>
+                    <span class="font-medium">${count}개</span>
+                  </div>
+                `).join('')}
               </div>
+            </div>
+          </div>
+          
+          <!-- Depth별 색상 범례 -->
+          <div class="mt-4 pt-4 border-t">
+            <h5 class="font-medium text-gray-900 mb-2">Depth 색상 범례</h5>
+            <div class="flex flex-wrap gap-3">
+              ${Array.from({length: maxDepth + 1}, (_, i) => `
+                <div class="flex items-center gap-2">
+                  <div class="w-4 h-4 rounded" style="background: linear-gradient(135deg, 
+                    ${i === 0 ? '#ef4444, #dc2626' : 
+                      i === 1 ? '#f97316, #ea580c' : 
+                      i === 2 ? '#eab308, #ca8a04' : 
+                      i === 3 ? '#22c55e, #16a34a' : 
+                      '#3b82f6, #2563eb'}
+                  )"></div>
+                  <span class="text-sm text-gray-700">Depth ${i} (${nodesByDepth[i]?.length || 0}개)</span>
+                </div>
+              `).join('')}
             </div>
           </div>
         </div>
       `
-    }, [networkData])
+      
+      // 확대/축소/리셋 버튼 이벤트
+      const zoomInBtn = container.querySelector('#zoom-in')
+      const zoomOutBtn = container.querySelector('#zoom-out')
+      const resetBtn = container.querySelector('#reset-view')
+      const svg = container.querySelector('#network-svg') as SVGElement
+      const viewport = container.querySelector('#network-viewport') as HTMLElement
+      
+      const updateZoom = (newZoom: number) => {
+        const clampedZoom = Math.max(0.1, Math.min(3, newZoom))
+        setZoom(clampedZoom)
+        if (svg) {
+          svg.style.transform = `scale(${clampedZoom}) translate(${panX}px, ${panY}px)`
+        }
+        // 줌 퍼센트 업데이트
+        const zoomText = container.querySelector('.text-sm.text-gray-600')
+        if (zoomText) {
+          zoomText.textContent = `${Math.round(clampedZoom * 100)}%`
+        }
+      }
+      
+      zoomInBtn?.addEventListener('click', () => updateZoom(zoom * 1.2))
+      zoomOutBtn?.addEventListener('click', () => updateZoom(zoom / 1.2))
+      resetBtn?.addEventListener('click', () => {
+        setZoom(1)
+        setPanX(0)
+        setPanY(0)
+        updateZoom(1)
+        if (svg) {
+          svg.style.transform = 'scale(1) translate(0px, 0px)'
+        }
+        if (viewport) {
+          viewport.scrollLeft = 0
+          viewport.scrollTop = 0
+        }
+      })
+      
+      // 드래그 이벤트 (팬)
+      let isDraggingLocal = false
+      let dragStartLocal = { x: 0, y: 0 }
+      
+      viewport?.addEventListener('mousedown', (e) => {
+        isDraggingLocal = true
+        dragStartLocal = { x: e.clientX - panX, y: e.clientY - panY }
+        viewport.style.cursor = 'grabbing'
+      })
+      
+      viewport?.addEventListener('mousemove', (e) => {
+        if (!isDraggingLocal) return
+        e.preventDefault()
+        const newPanX = e.clientX - dragStartLocal.x
+        const newPanY = e.clientY - dragStartLocal.y
+        setPanX(newPanX)
+        setPanY(newPanY)
+        if (svg) {
+          svg.style.transform = `scale(${zoom}) translate(${newPanX}px, ${newPanY}px)`
+        }
+      })
+      
+      viewport?.addEventListener('mouseup', () => {
+        isDraggingLocal = false
+        viewport.style.cursor = 'grab'
+      })
+      
+      viewport?.addEventListener('mouseleave', () => {
+        isDraggingLocal = false
+        viewport.style.cursor = 'grab'
+      })
+      
+      // 휠 줌
+      viewport?.addEventListener('wheel', (e) => {
+        e.preventDefault()
+        const delta = e.deltaY > 0 ? 0.9 : 1.1
+        updateZoom(zoom * delta)
+      })
+      
+      // 노드 클릭 이벤트 추가
+      const nodeGroups = container.querySelectorAll('.node-group')
+      nodeGroups.forEach(nodeGroup => {
+        nodeGroup.addEventListener('click', (e) => {
+          const nodeId = (e.currentTarget as HTMLElement).getAttribute('data-id')
+          const clickedNode = networkData.nodes.find(n => n.id === nodeId)
+          if (clickedNode) {
+            console.log('Clicked node:', clickedNode)
+            // 여기에 노드 클릭 시 추가 동작을 구현할 수 있습니다
+          }
+        })
+      })
+      
+    }, [networkData, zoom, panX, panY])
 
     return (
       <div className="w-full">
-        <div id="network-container" className="flex justify-center"></div>
+        <div id="network-container" className="w-full"></div>
       </div>
     )
   }

@@ -1,4 +1,5 @@
 import { PrismaService } from '../prisma/prisma.service';
+import { SupabaseService } from '../supabase/supabase.service';
 export interface CrawlResult {
     id: string;
     url: string;
@@ -49,15 +50,22 @@ export interface AnalysisResult {
 }
 export declare class CrawlerService {
     private prisma;
+    private supabaseService;
     private readonly logger;
-    constructor(prisma: PrismaService);
-    startCrawling(userId: number, targetUrl: string, maxPages?: number): Promise<string>;
+    constructor(prisma: PrismaService, supabaseService: SupabaseService);
+    startCrawling(userId: number, targetUrl: string, maxPages?: number, supabaseUserId?: string): Promise<string>;
     private performOptimizedCrawling;
     private fastUrlDiscovery;
     private parallelCrawl;
     private fastCrawlPage;
     private quickRemoveCookies;
     getPreviewAnalysis(url: string): Promise<AnalysisResult>;
+    private classifyPageType;
+    getPageDetails(url: string): Promise<{
+        screenshotPath: string;
+        htmlPath: string;
+        title: string;
+    }>;
     private generateNetworkData;
     private generateVisualizationHtml;
     getUserAnalyses(userId: number, limit?: number): Promise<{
@@ -82,6 +90,7 @@ export declare class CrawlerService {
         pageCount: number;
         screenshotPath: string | null;
         htmlPath: string | null;
+        creditsUsed: number;
         userId: number;
     }>;
     downloadFile(analysisId: string, userId: number, fileType: 'png' | 'html', pageId: string): Promise<{

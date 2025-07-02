@@ -3,6 +3,7 @@
 import { useState, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
+import CreditCard from '../components/CreditCard'
 
 interface UserAnalysis {
   id: string
@@ -236,7 +237,7 @@ export default function Dashboard() {
       {/* Main Content */}
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         {/* Stats Cards */}
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-6 mb-8">
           <div className="bg-white/90 backdrop-blur-lg rounded-2xl shadow-xl p-6 border border-white/20">
             <div className="flex items-center">
               <div className="w-12 h-12 bg-gradient-to-r from-blue-500 to-cyan-500 rounded-xl flex items-center justify-center mr-4">
@@ -296,6 +297,9 @@ export default function Dashboard() {
               </div>
             </div>
           </div>
+
+          {/* 크레딧 카드 */}
+          <CreditCard />
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">

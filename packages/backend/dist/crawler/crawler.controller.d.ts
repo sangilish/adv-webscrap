@@ -34,6 +34,7 @@ export declare class CrawlerController {
         pageCount: number;
         screenshotPath: string | null;
         htmlPath: string | null;
+        creditsUsed: number;
         userId: number;
     }>;
     getUserAnalyses(req: any, limit?: string): Promise<{
@@ -49,4 +50,9 @@ export declare class CrawlerController {
     downloadFile(req: any, analysisId: string, pageId: string, fileType: 'png' | 'html', res: Response): Promise<void>;
     getScreenshot(analysisId: string, filename: string, res: Response): Promise<void>;
     getTempScreenshot(tempId: string, filename: string, res: Response): Promise<void>;
+    getPageDetails(url: string, response: Response): Promise<{
+        screenshotPath: string;
+        htmlPath: string;
+        title: string;
+    }>;
 }

@@ -1,10 +1,12 @@
-export const runtime = 'nodejs';
+import { NextRequest, NextResponse } from 'next/server';
 
-export async function POST(request: Request) {
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:3003';
+
+export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
     
-    const response = await fetch('http://localhost:3003/auth/login', {
+    const response = await fetch(`${BACKEND_URL}/auth/login`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -14,10 +16,10 @@ export async function POST(request: Request) {
 
     const data = await response.json();
     
-    return Response.json(data, { status: response.status });
+    return NextResponse.json(data, { status: response.status });
   } catch (error) {
     console.error('Login proxy error:', error);
-    return Response.json(
+    return NextResponse.json(
       { message: 'Internal server error' },
       { status: 500 }
     );
