@@ -51,10 +51,10 @@ export class CrawlerController {
     }
 
     try {
-      console.log('Calling crawlerService.getPreviewAnalysis...');
-      const result = await this.crawlerService.getPreviewAnalysis(url);
+    console.log('Calling crawlerService.getPreviewAnalysis...');
+    const result = await this.crawlerService.getPreviewAnalysis(url);
       console.log('Service returned result with', result.results.length, 'pages');
-      return result;
+    return result;
     } catch (error) {
       console.error('Error in getPreviewAnalysis:', error);
       return {

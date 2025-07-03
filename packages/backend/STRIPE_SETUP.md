@@ -6,8 +6,9 @@
 
 ```bash
 # Stripe 설정
-STRIPE_SECRET_KEY=sk_test_your_stripe_secret_key_here
-STRIPE_WEBHOOK_SECRET=whsec_your_webhook_secret_here
+STRIPE_SECRET_KEY="sk_test_YOUR_STRIPE_SECRET_KEY_HERE"
+STRIPE_PUBLISHABLE_KEY="pk_test_YOUR_STRIPE_PUBLISHABLE_KEY_HERE"
+STRIPE_WEBHOOK_SECRET="whsec_YOUR_WEBHOOK_SECRET_HERE"
 
 # Frontend URL (결제 리다이렉트용)
 FRONTEND_URL=http://localhost:3001
@@ -111,4 +112,17 @@ npx prisma db push
 
 # Stripe CLI (웹훅 테스트용)
 stripe listen --forward-to localhost:3003/payments/webhook
-``` 
+```
+
+## Testing with Stripe CLI
+
+1. Install Stripe CLI
+2. Login: `stripe login`
+3. Forward webhooks: `stripe listen --forward-to localhost:3003/payments/webhook`
+4. Use test cards from Stripe documentation
+
+## Test Cards
+
+- Success: `4242 4242 4242 4242`
+- Decline: `4000 0000 0000 0002`
+- Require 3D Secure: `4000 0025 0000 3155` 

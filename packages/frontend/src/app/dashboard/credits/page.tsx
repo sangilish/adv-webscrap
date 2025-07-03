@@ -130,6 +130,104 @@ export default function CreditsDashboard() {
             </div>
           )}
 
+          {/* 결제 완료 후 크레딧 미반영 해결 도구 */}
+          <div className="bg-blue-50 border border-blue-200 rounded-xl p-4">
+            <div className="flex items-start">
+              <svg className="w-5 h-5 text-blue-600 mr-3 mt-0.5" fill="currentColor" viewBox="0 0 20 20">
+                <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" />
+              </svg>
+              <div className="flex-1">
+                <h3 className="text-blue-800 font-medium">결제 완료 후 크레딧이 반영되지 않았나요?</h3>
+                <p className="text-blue-700 text-sm mb-3">
+                  결제는 완료되었지만 크레딧이 계정에 추가되지 않은 경우, 아래 버튼을 클릭해서 수동으로 처리할 수 있습니다.
+                </p>
+                <div className="flex space-x-3">
+                  <input
+                    type="text"
+                    placeholder="결제 세션 ID 입력 (cs_test_...)"
+                    className="flex-1 px-3 py-2 border border-blue-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    id="sessionIdInput"
+                  />
+                  <button
+                    onClick={async () => {
+                      const sessionId = (document.getElementById('sessionIdInput') as HTMLInputElement)?.value;
+                      if (!sessionId) {
+                        alert('세션 ID를 입력해주세요.');
+                        return;
+                      }
+                      
+                      try {
+                        const token = localStorage.getItem('token');
+                        const response = await fetch('/api/payments/process-payment', {
+                          method: 'POST',
+                          headers: {
+                            'Content-Type': 'application/json',
+                            'Authorization': `Bearer ${token}`,
+                          },
+                          body: JSON.stringify({ sessionId }),
+                        });
+
+                        if (response.ok) {
+                          const result = await response.json();
+                          alert(`결제 처리 완료! 현재 크레딧: ${result.credits}`);
+                          window.location.reload();
+                        } else {
+                          const error = await response.json();
+                          alert(`처리 실패: ${error.error || '알 수 없는 오류'}`);
+                        }
+                      } catch (error) {
+                        alert('처리 중 오류가 발생했습니다.');
+                        console.error(error);
+                      }
+                    }}
+                    className="px-4 py-2 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700 transition-colors"
+                  >
+                    크레딧 추가
+                  </button>
+                </div>
+                
+                {/* 디버깅: 결제 내역 확인 */}
+                <div className="mt-4 pt-4 border-t border-blue-200">
+                  <button
+                    onClick={async () => {
+                      try {
+                        const token = localStorage.getItem('token');
+                        const response = await fetch('/api/payments/debug-history', {
+                          headers: {
+                            'Authorization': `Bearer ${token}`,
+                          },
+                        });
+
+                        if (response.ok) {
+                          const result = await response.json();
+                          console.log('결제 내역:', result);
+                          
+                          let message = `총 ${result.totalPayments}개의 결제 기록:\n\n`;
+                          result.payments.forEach((p: any, i: number) => {
+                            message += `${i + 1}. $${p.amountInDollars} (${p.creditsGranted} 크레딧)\n`;
+                            message += `   상태: ${p.status}, 타입: ${p.type}\n`;
+                            message += `   세션: ${p.stripeSessionId}\n\n`;
+                          });
+                          
+                          alert(message);
+                        } else {
+                          const error = await response.json();
+                          alert(`조회 실패: ${error.error || '알 수 없는 오류'}`);
+                        }
+                      } catch (error) {
+                        alert('조회 중 오류가 발생했습니다.');
+                        console.error(error);
+                      }
+                    }}
+                    className="text-blue-600 hover:text-blue-800 text-sm underline"
+                  >
+                    결제 내역 확인 (디버깅)
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
           {/* 크레딧 잔액 */}
           <CreditBalance />
 

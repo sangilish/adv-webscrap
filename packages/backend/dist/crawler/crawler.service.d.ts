@@ -6,13 +6,20 @@ export interface CrawlResult {
     title: string;
     pageType: string;
     links: string[];
-    images: string[];
+    images: {
+        src: string;
+        alt: string;
+        isExternal: boolean;
+    }[];
     headings: {
         level: string;
         text: string;
     }[];
     forms: number;
-    buttons: string[];
+    buttons: {
+        text: string;
+        type: string;
+    }[];
     textContent: string;
     screenshotPath: string;
     htmlPath: string;
@@ -31,6 +38,9 @@ export interface NetworkNode {
     url: string;
     title: string;
     screenshot: string;
+    nodeType: 'page' | 'button';
+    buttonType?: string;
+    parentPageId?: string;
 }
 export interface NetworkEdge {
     from: string;
@@ -59,6 +69,8 @@ export declare class CrawlerService {
     private parallelCrawl;
     private fastCrawlPage;
     private quickRemoveCookies;
+    private refineTitle;
+    private filterButtons;
     getPreviewAnalysis(url: string): Promise<AnalysisResult>;
     private classifyPageType;
     getPageDetails(url: string): Promise<{

@@ -276,8 +276,15 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
                             .filter(href => href.startsWith('http') && !href.includes('#'))
                             .slice(0, 20);
                         const images = Array.from(document.querySelectorAll('img[src]'))
-                            .map(img => img.src)
-                            .filter(src => src.startsWith('http'))
+                            .map(img => {
+                            const imgEl = img;
+                            const srcAttr = imgEl.getAttribute('src') || imgEl.getAttribute('data-src');
+                            const src = srcAttr || imgEl.src || '';
+                            const alt = imgEl.alt || '';
+                            const isExternal = src.startsWith('http') && !src.includes(location.hostname);
+                            return { src, alt, isExternal };
+                        })
+                            .filter(img => img.src && img.src !== '' && !img.src.includes('data:'))
                             .slice(0, 10);
                         const headings = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6'))
                             .slice(0, 20)
@@ -357,16 +364,19 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
                     progress: Math.round(((index + 1) / total) * 100)
                 },
             }).catch(() => { });
+            const refinedTitle = this.refineTitle(url, pageData.title);
+            const btnObjs = pageData.buttons.map((b) => typeof b === 'string' ? { text: b, type: 'button' } : b);
+            const cleanButtons = this.filterButtons(btnObjs);
             return {
                 id: pageId,
                 url,
-                title: pageData.title,
+                title: refinedTitle,
                 pageType,
                 links: pageData.links,
                 images: pageData.images,
                 headings: pageData.headings,
                 forms: pageData.forms,
-                buttons: pageData.buttons,
+                buttons: cleanButtons,
                 textContent: pageData.textContent,
                 screenshotPath,
                 htmlPath: `/temp/${path.basename(outputDir)}/html/${htmlFilename}`,
@@ -408,6 +418,33 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
         }
         catch {
         }
+    }
+    refineTitle(pageUrl, rawTitle) {
+        const cleaned = (rawTitle || '').trim();
+        const lower = cleaned.toLowerCase();
+        if (!cleaned || lower === 'home' || lower === 'index' || lower === 'homepage') {
+            const pathname = new URL(pageUrl).pathname.replace(/\/$/, '');
+            if (!pathname || pathname === '' || pathname === '/')
+                return 'Home';
+            const slug = pathname.split('/').filter(Boolean).pop() || 'Page';
+            return slug
+                .replace(/[-_]/g, ' ')
+                .replace(/\b\w/g, (c) => c.toUpperCase());
+        }
+        return cleaned;
+    }
+    filterButtons(buttons) {
+        const noiseRegex = /(carousel|arrow|switch|index|닫기|열기|prev|next|menu)/i;
+        const uniq = {};
+        return buttons
+            .filter((b) => b.text && b.text.length >= 2 && !noiseRegex.test(b.text))
+            .filter((b) => {
+            if (uniq[b.text])
+                return false;
+            uniq[b.text] = true;
+            return true;
+        })
+            .slice(0, 8);
     }
     async getPreviewAnalysis(url) {
         this.logger.log(`=== getPreviewAnalysis START (링크 구조만 빠르게 탐색) ===`);
@@ -454,9 +491,32 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
                 try {
                     this.logger.log(`🔍 Discovering structure (${allResults.length + 1}): ${pageUrl} (depth: ${depth})`);
                     await page.goto(pageUrl, {
-                        waitUntil: 'domcontentloaded',
-                        timeout: 10000
+                        waitUntil: 'load',
+                        timeout: 15000
                     });
+                    await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => { });
+                    await page.waitForTimeout(1500);
+                    await page.evaluate(() => {
+                        const menuSelectors = [
+                            'button[aria-label*="menu"]',
+                            'button[class*="menu"]',
+                            'button[class*="nav"]',
+                            '.menu-toggle',
+                            '.nav-toggle',
+                            '[data-toggle="menu"]',
+                            '[role="button"][aria-expanded="false"]'
+                        ];
+                        menuSelectors.forEach(selector => {
+                            const elements = document.querySelectorAll(selector);
+                            elements.forEach(el => {
+                                try {
+                                    el.click();
+                                }
+                                catch { }
+                            });
+                        });
+                    }).catch(() => { });
+                    await page.waitForTimeout(1000);
                     const pageData = await page.evaluate(() => {
                         const cookieSelectors = [
                             '[class*="cookie"]', '[id*="cookie"]',
@@ -472,20 +532,82 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
                                 }
                             });
                         });
-                        const links = Array.from(document.querySelectorAll('a[href]'))
-                            .map(a => {
-                            const href = a.href;
+                        const collectLinks = () => {
+                            const urlSet = new Set();
+                            document.querySelectorAll('a[href]').forEach((a) => {
+                                try {
+                                    const href = a.href;
+                                    const abs = new URL(href, location.href);
+                                    if (abs.protocol.startsWith('http')) {
+                                        urlSet.add(abs.toString());
+                                    }
+                                }
+                                catch { }
+                            });
+                            document.querySelectorAll('router-link[to], nuxt-link[to]').forEach((el) => {
+                                const to = el.getAttribute('to');
+                                if (to) {
+                                    try {
+                                        urlSet.add(new URL(to, location.origin).toString());
+                                    }
+                                    catch { }
+                                }
+                            });
                             try {
-                                const linkUrl = new URL(href);
-                                if (linkUrl.protocol === 'http:' || linkUrl.protocol === 'https:') {
-                                    return linkUrl.toString();
+                                const nextData = window.__NEXT_DATA__;
+                                if (nextData) {
+                                    if (typeof nextData.page === 'string') {
+                                        urlSet.add(new URL(nextData.page, location.origin).toString());
+                                    }
+                                    const buildPages = nextData.__BUILD_MANIFEST?.sortedPages || [];
+                                    buildPages.forEach((p) => {
+                                        if (p) {
+                                            urlSet.add(new URL(p, location.origin).toString());
+                                        }
+                                    });
                                 }
                             }
                             catch { }
-                            return null;
-                        })
-                            .filter((link) => link !== null)
-                            .filter((link, index, arr) => arr.indexOf(link) === index);
+                            try {
+                                const nuxtData = window.__NUXT__;
+                                if (nuxtData && Array.isArray(nuxtData.routes)) {
+                                    nuxtData.routes.forEach((r) => {
+                                        if (r) {
+                                            urlSet.add(new URL(r, location.origin).toString());
+                                        }
+                                    });
+                                }
+                            }
+                            catch { }
+                            document.querySelectorAll('[data-href], [data-url], [data-link]').forEach((el) => {
+                                const dataHref = el.getAttribute('data-href') ||
+                                    el.getAttribute('data-url') ||
+                                    el.getAttribute('data-link');
+                                if (dataHref) {
+                                    try {
+                                        urlSet.add(new URL(dataHref, location.origin).toString());
+                                    }
+                                    catch { }
+                                }
+                            });
+                            const currentPath = location.pathname;
+                            const commonRoutes = [
+                                '/about', '/about-us', '/company',
+                                '/products', '/services', '/solutions',
+                                '/contact', '/contact-us', '/support',
+                                '/blog', '/news', '/resources',
+                                '/pricing', '/plans', '/features',
+                                '/login', '/signup', '/register',
+                                '/careers', '/jobs', '/team',
+                                '/help', '/faq', '/documentation',
+                                '/privacy', '/terms', '/legal'
+                            ];
+                            commonRoutes.forEach(route => {
+                                urlSet.add(new URL(route, location.origin).toString());
+                            });
+                            return Array.from(urlSet);
+                        };
+                        const links = collectLinks();
                         const title = document.title || '';
                         const headings = Array.from(document.querySelectorAll('h1, h2, h3'))
                             .map(h => ({
@@ -494,34 +616,78 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
                         }))
                             .filter(h => h.text.length > 0)
                             .slice(0, 5);
+                        const buttons = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"], [role="button"]'))
+                            .map(btn => {
+                            const text = btn.textContent?.trim() ||
+                                btn.value ||
+                                btn.getAttribute('aria-label') ||
+                                btn.getAttribute('title') ||
+                                '버튼';
+                            const type = btn.tagName.toLowerCase() === 'button' ? 'button' :
+                                btn.type || 'button';
+                            return { text: text.substring(0, 30), type };
+                        })
+                            .filter(btn => btn.text.length > 0)
+                            .slice(0, 10);
+                        const images = Array.from(document.querySelectorAll('img'))
+                            .map(img => {
+                            const imgEl = img;
+                            const srcAttr = imgEl.getAttribute('src') || imgEl.getAttribute('data-src');
+                            const src = srcAttr || imgEl.src || '';
+                            const alt = imgEl.alt || '';
+                            const isExternal = src.startsWith('http') && !src.includes(location.hostname);
+                            return { src, alt, isExternal };
+                        })
+                            .filter(img => img.src && img.src !== '' && !img.src.includes('data:'))
+                            .slice(0, 20);
+                        const bgImages = Array.from(document.querySelectorAll('*'))
+                            .map(el => {
+                            const style = window.getComputedStyle(el);
+                            const bgImage = style.backgroundImage;
+                            if (bgImage && bgImage !== 'none' && bgImage.includes('url(')) {
+                                const match = bgImage.match(/url\(['"]?([^'"]+)['"]?\)/);
+                                if (match && match[1]) {
+                                    return { src: match[1], alt: 'Background Image', isExternal: false };
+                                }
+                            }
+                            return null;
+                        })
+                            .filter(Boolean)
+                            .slice(0, 5);
+                        const allImages = [...images, ...bgImages];
                         const textContent = document.body.textContent?.trim().substring(0, 300) || '';
                         const wordCount = textContent.split(/\s+/).length;
                         return {
                             title,
-                            links: links.slice(0, 15),
+                            links: links.slice(0, 30),
                             headings,
+                            buttons,
+                            images: allImages,
                             textContent,
                             wordCount
                         };
                     });
                     const filteredLinks = filterSameDomainLinks(pageData.links);
+                    const refinedTitle = this.refineTitle(pageUrl, pageData.title);
+                    const btnObjs2 = pageData.buttons.map((b) => typeof b === 'string' ? { text: b, type: 'button' } : b);
+                    const cleanButtons = this.filterButtons(btnObjs2);
                     const result = {
                         id: `preview_${Date.now()}_${allResults.length}_depth${depth}`,
                         url: pageUrl,
-                        title: pageData.title,
-                        pageType: this.classifyPageType(pageUrl, pageData.title),
+                        title: refinedTitle,
+                        pageType: this.classifyPageType(pageUrl, refinedTitle),
                         links: filteredLinks,
-                        images: [],
+                        images: pageData.images,
                         headings: pageData.headings,
                         forms: 0,
-                        buttons: [],
+                        buttons: cleanButtons,
                         textContent: pageData.textContent,
                         screenshotPath: '',
                         htmlPath: '',
                         timestamp: new Date().toISOString(),
                         metadata: {
                             wordCount: pageData.wordCount,
-                            imageCount: 0,
+                            imageCount: pageData.images.length,
                             linkCount: filteredLinks.length
                         }
                     };
@@ -657,8 +823,31 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
                     type: result.pageType,
                     url: result.url,
                     title: result.title,
-                    screenshot: result.screenshotPath
+                    screenshot: result.screenshotPath,
+                    nodeType: 'page'
                 });
+                if (result.buttons && result.buttons.length > 0) {
+                    result.buttons.forEach((button, index) => {
+                        const buttonText = button.text;
+                        const buttonType = button.type;
+                        nodes.push({
+                            id: `${result.id}_button_${index}`,
+                            label: buttonText,
+                            color: '#6366f1',
+                            type: buttonType,
+                            url: result.url,
+                            title: `${buttonText} (${result.title})`,
+                            screenshot: result.screenshotPath,
+                            nodeType: 'button',
+                            buttonType,
+                            parentPageId: result.id
+                        });
+                        edges.push({
+                            from: result.id,
+                            to: `${result.id}_button_${index}`
+                        });
+                    });
+                }
             }
         });
         results.forEach(result => {

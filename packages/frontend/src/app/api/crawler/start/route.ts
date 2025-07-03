@@ -10,7 +10,8 @@ export async function POST(request: Request) {
 
     const body = await request.json()
 
-    const response = await fetch('http://localhost:3001/crawler/start', {
+    const backendUrl = process.env.BACKEND_URL || 'http://localhost:3003';
+    const response = await fetch(`${backendUrl}/crawler/start`, {
       method: 'POST',
       headers: {
         'Authorization': authHeader,

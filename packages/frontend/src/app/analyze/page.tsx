@@ -80,6 +80,9 @@ interface NetworkNode {
   url: string;
   title: string;
   screenshot: string;
+  nodeType: 'page' | 'button';
+  buttonType?: string;
+  parentPageId?: string;
 }
 
 interface NetworkEdge {
@@ -471,39 +474,67 @@ export default function AnalyzePage() {
       const container = document.getElementById('network-container')
       if (!container) return
 
-      // 노드를 depth별로 그룹화
-      const nodesByDepth = networkData.nodes.reduce((acc, node) => {
-        // ID에서 depth 정보 추출: preview_timestamp_index_depthN
+      // 페이지 노드와 버튼 노드 분리
+      const pageNodes = networkData.nodes.filter(node => node.nodeType === 'page')
+      const buttonNodes = networkData.nodes.filter(node => node.nodeType === 'button')
+
+      // 페이지 노드를 depth별로 그룹화
+      const pagesByDepth = pageNodes.reduce((acc, node) => {
         const depthMatch = node.id.match(/depth(\d+)/)
         const depth = depthMatch ? parseInt(depthMatch[1]) : 0
         if (!acc[depth]) acc[depth] = []
         acc[depth].push(node)
         return acc
-      }, {} as Record<number, typeof networkData.nodes>)
+      }, {} as Record<number, typeof pageNodes>)
 
-      const maxDepth = Math.max(...Object.keys(nodesByDepth).map(Number))
-      const svgWidth = Math.max(1200, (maxDepth + 1) * 300) // 왼쪽에서 오른쪽으로 더 넓게
-      const svgHeight = 800
+      const maxDepth = Math.max(...Object.keys(pagesByDepth).map(Number))
+      const svgWidth = Math.max(1400, (maxDepth + 1) * 350) // 버튼 공간 고려하여 더 넓게
+      const svgHeight = 900
       
-      // 왼쪽에서 오른쪽으로 계층적 레이아웃 계산 (수평 배치)
-      const nodes = networkData.nodes.map(node => {
+      // 페이지 노드 레이아웃 계산 (왼쪽에서 오른쪽으로)
+      const pageNodesWithLayout = pageNodes.map(node => {
         const depthMatch = node.id.match(/depth(\d+)/)
         const depth = depthMatch ? parseInt(depthMatch[1]) : 0
-        const nodesAtDepth = nodesByDepth[depth]
+        const nodesAtDepth = pagesByDepth[depth]
         const indexAtDepth = nodesAtDepth.indexOf(node)
         const totalAtDepth = nodesAtDepth.length
         
-        // 각 depth별로 세로로 균등 배치, depth는 가로로 배치
-        const x = 150 + depth * 280 // depth별로 가로로 배치 (왼쪽에서 오른쪽)
-        const y = (svgHeight / (totalAtDepth + 1)) * (indexAtDepth + 1) // 세로로 균등 배치
+        // 페이지는 각 depth의 왼쪽에 배치
+        const x = 100 + depth * 350
+        const y = (svgHeight / (totalAtDepth + 1)) * (indexAtDepth + 1)
         
         return {
           ...node,
           x,
           y,
-          depth
+          depth,
+          nodeType: 'page' as const
         }
       })
+
+      // 버튼 노드 레이아웃 계산 (해당 페이지 오른쪽에 배치)
+      const buttonNodesWithLayout = buttonNodes.map(button => {
+        const parentPage = pageNodesWithLayout.find(page => page.id === button.parentPageId)
+        if (!parentPage) return null
+
+        // 해당 페이지의 버튼들 찾기
+        const siblingButtons = buttonNodes.filter(btn => btn.parentPageId === button.parentPageId)
+        const buttonIndex = siblingButtons.indexOf(button)
+        
+        // 페이지 오른쪽에 버튼들을 세로로 배치
+        const x = parentPage.x + 120 // 페이지 오른쪽
+        const y = parentPage.y - 40 + (buttonIndex * 25) // 페이지 위아래로 버튼 배치
+        
+        return {
+          ...button,
+          x,
+          y,
+          depth: parentPage.depth,
+          nodeType: 'button' as const
+        }
+      }).filter(Boolean)
+
+      const allNodes = [...pageNodesWithLayout, ...buttonNodesWithLayout]
       
       container.innerHTML = `
         <div class="bg-white border rounded-lg overflow-hidden">
@@ -586,8 +617,8 @@ export default function AnalyzePage() {
                 
                 <!-- 연결선 -->
                 ${networkData.edges.map(edge => {
-                  const fromNode = nodes.find(n => n.id === edge.from)
-                  const toNode = nodes.find(n => n.id === edge.to)
+                  const fromNode = allNodes.find((n: any) => n.id === edge.from)
+                  const toNode = allNodes.find((n: any) => n.id === edge.to)
                   if (!fromNode || !toNode) return ''
                   
                   return `
@@ -597,40 +628,62 @@ export default function AnalyzePage() {
                 }).join('')}
                 
                 <!-- 노드 -->
-                ${nodes.map((node, index) => {
-                  const depthColor = `depth${Math.min(node.depth, 4)}`
-                  return `
-                    <g class="node-group" data-id="${node.id}" style="cursor: pointer;" 
-                       onmouseover="this.style.transform='scale(1.1)'" 
-                       onmouseout="this.style.transform='scale(1)'">
-                      <circle cx="${node.x}" cy="${node.y}" r="35" 
+                ${allNodes.map((node: any, index: number) => {
+                  if (node.nodeType === 'page') {
+                    const depthColor = `depth${Math.min(node.depth, 4)}`
+                    return `
+                      <g class="node-group page-node" data-id="${node.id}" style="cursor: pointer;" 
+                         onmouseover="this.style.transform='scale(1.05)'" 
+                         onmouseout="this.style.transform='scale(1)'">
+                        <rect x="${node.x - 50}" y="${node.y - 30}" width="100" height="60" 
                               fill="url(#${depthColor})" 
                               stroke="#ffffff" 
                               stroke-width="3" 
+                              rx="8"
                               filter="url(#drop-shadow)" />
-                      <text x="${node.x}" y="${node.y - 8}" 
-                            text-anchor="middle" 
-                            fill="white" 
-                            font-size="10" 
-                            font-weight="bold">
-                        ${node.type}
-                      </text>
-                      <text x="${node.x}" y="${node.y + 6}" 
-                            text-anchor="middle" 
-                            fill="white" 
-                            font-size="8">
-                        D${node.depth}
-                      </text>
-                      <text x="${node.x}" y="${node.y + 55}" 
-                            text-anchor="middle" 
-                            fill="#374151" 
-                            font-size="10" 
-                            font-weight="500"
-                            style="max-width: 120px;">
-                        ${node.label.length > 20 ? node.label.substring(0, 20) + '...' : node.label}
-                      </text>
-                    </g>
-                  `
+                        <text x="${node.x}" y="${node.y - 8}" 
+                              text-anchor="middle" 
+                              fill="white" 
+                              font-size="10" 
+                              font-weight="bold">
+                          ${node.type}
+                        </text>
+                        <text x="${node.x}" y="${node.y + 6}" 
+                              text-anchor="middle" 
+                              fill="white" 
+                              font-size="8">
+                          D${node.depth}
+                        </text>
+                        <text x="${node.x}" y="${node.y + 45}" 
+                              text-anchor="middle" 
+                              fill="#374151" 
+                              font-size="9" 
+                              font-weight="500">
+                          ${node.label.length > 15 ? node.label.substring(0, 15) + '...' : node.label}
+                        </text>
+                      </g>
+                    `
+                  } else if (node.nodeType === 'button') {
+                    return `
+                      <g class="node-group button-node" data-id="${node.id}" style="cursor: pointer;" 
+                         onmouseover="this.style.transform='scale(1.1)'" 
+                         onmouseout="this.style.transform='scale(1)'">
+                        <ellipse cx="${node.x}" cy="${node.y}" rx="25" ry="12" 
+                                fill="#6366f1" 
+                                stroke="#ffffff" 
+                                stroke-width="2" 
+                                filter="url(#drop-shadow)" />
+                        <text x="${node.x}" y="${node.y + 2}" 
+                              text-anchor="middle" 
+                              fill="white" 
+                              font-size="8" 
+                              font-weight="600">
+                          ${node.label.length > 8 ? node.label.substring(0, 8) + '...' : node.label}
+                        </text>
+                      </g>
+                    `
+                  }
+                  return ''
                 }).join('')}
               </svg>
             </div>
@@ -645,7 +698,8 @@ export default function AnalyzePage() {
               <h5 class="font-medium text-gray-900 mb-2">계층 통계</h5>
               <div class="space-y-1 text-sm text-gray-700">
                 <div>최대 깊이: ${maxDepth}단계</div>
-                <div>총 노드: ${nodes.length}개</div>
+                <div>총 페이지: ${pageNodesWithLayout.length}개</div>
+                <div>총 버튼: ${buttonNodesWithLayout.length}개</div>
                 <div>총 연결: ${networkData.edges.length}개</div>
               </div>
             </div>
@@ -653,27 +707,26 @@ export default function AnalyzePage() {
             <div class="bg-gray-50 p-4 rounded">
               <h5 class="font-medium text-gray-900 mb-2">Depth별 분포</h5>
               <div class="space-y-1 text-sm">
-                ${Object.entries(nodesByDepth).map(([depth, depthNodes]) => `
+                ${Object.entries(pagesByDepth).map(([depth, depthPages]: [string, any]) => `
                   <div class="flex items-center justify-between">
                     <span class="text-gray-700">Depth ${depth}:</span>
-                    <span class="font-medium">${depthNodes.length}개</span>
+                    <span class="font-medium">${depthPages.length}개 페이지</span>
                   </div>
                 `).join('')}
               </div>
             </div>
             
             <div class="bg-gray-50 p-4 rounded">
-              <h5 class="font-medium text-gray-900 mb-2">페이지 유형</h5>
+              <h5 class="font-medium text-gray-900 mb-2">노드 유형별</h5>
               <div class="space-y-1 text-sm">
-                ${Object.entries(nodes.reduce((acc, node) => {
-                  acc[node.type] = (acc[node.type] || 0) + 1
-                  return acc
-                }, {} as Record<string, number>)).map(([type, count]) => `
-                  <div class="flex items-center justify-between">
-                    <span class="text-gray-700">${type}:</span>
-                    <span class="font-medium">${count}개</span>
-                  </div>
-                `).join('')}
+                <div class="flex items-center justify-between">
+                  <span class="text-gray-700">📄 페이지:</span>
+                  <span class="font-medium">${pageNodesWithLayout.length}개</span>
+                </div>
+                <div class="flex items-center justify-between">
+                  <span class="text-gray-700">🔘 버튼:</span>
+                  <span class="font-medium">${buttonNodesWithLayout.length}개</span>
+                </div>
               </div>
             </div>
           </div>
@@ -691,7 +744,7 @@ export default function AnalyzePage() {
                       i === 3 ? '#22c55e, #16a34a' : 
                       '#3b82f6, #2563eb'}
                   )"></div>
-                  <span class="text-sm text-gray-700">Depth ${i} (${nodesByDepth[i]?.length || 0}개)</span>
+                  <span class="text-sm text-gray-700">Depth ${i} (${pagesByDepth[i]?.length || 0}개)</span>
                 </div>
               `).join('')}
             </div>
@@ -1044,8 +1097,8 @@ export default function AnalyzePage() {
                 <div className="p-4 overflow-y-auto h-[520px]">
                   {viewMode === 'structure' ? (
                     <div>
-                      {siteMap.map(node => renderTreeNode(node))}
-                    </div>
+                  {siteMap.map(node => renderTreeNode(node))}
+                </div>
                   ) : (
                     <div className="h-full">
                       {result && result.networkData ? (
@@ -1087,16 +1140,16 @@ export default function AnalyzePage() {
                                 const locked = isPreview && result && result.results.findIndex(r => r.id === selectedNode.id) >= (result?.previewLimit || 5)
                                 return (
                                   <>
-                                    <img
+                              <img 
                                       src={getScreenshotUrl(selectedNode.screenshotPath || pageDetailsCache[selectedNode.url]?.screenshotPath)}
-                                      alt={`Screenshot of ${selectedNode.title}`}
+                                alt={`Screenshot of ${selectedNode.title}`}
                                       className={`w-full max-h-96 object-contain rounded-lg mb-4 ${locked ? 'filter blur-sm opacity-50' : ''}`}
-                                      onError={(e) => {
-                                        e.currentTarget.style.display = 'none'
+                                onError={(e) => {
+                                  e.currentTarget.style.display = 'none'
                                         const nextElement = e.currentTarget.nextElementSibling as HTMLElement
                                         if (nextElement) nextElement.style.display = 'block'
-                                      }}
-                                    />
+                                }}
+                              />
                                     {locked && (
                                       <div className="absolute inset-0 flex flex-col items-center justify-center text-center px-4">
                                         <div className="bg-white/80 backdrop-blur-lg p-4 rounded-xl shadow-lg">

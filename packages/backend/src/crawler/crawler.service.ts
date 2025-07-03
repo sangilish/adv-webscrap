@@ -15,10 +15,10 @@ export interface CrawlResult {
   title: string;
   pageType: string;
   links: string[];
-  images: string[];
+  images: { src: string; alt: string; isExternal: boolean }[];
   headings: { level: string; text: string }[];
   forms: number;
-  buttons: string[];
+  buttons: { text: string; type: string }[];
   textContent: string;
   screenshotPath: string;
   htmlPath: string;
@@ -38,6 +38,9 @@ export interface NetworkNode {
     url: string;
     title: string;
     screenshot: string;
+    nodeType: 'page' | 'button';
+    buttonType?: string;
+    parentPageId?: string;
 }
 
 export interface NetworkEdge {
@@ -439,8 +442,15 @@ export class CrawlerService {
 
             // Extract other data
       const images = Array.from(document.querySelectorAll('img[src]'))
-        .map(img => (img as HTMLImageElement).src)
-              .filter(src => src.startsWith('http'))
+        .map(img => {
+          const imgEl = img as HTMLImageElement;
+          const srcAttr = imgEl.getAttribute('src') || imgEl.getAttribute('data-src');
+          const src = srcAttr || imgEl.src || '';
+          const alt = imgEl.alt || '';
+          const isExternal = src.startsWith('http') && !src.includes(location.hostname);
+          return { src, alt, isExternal };
+        })
+              .filter(img => img.src && img.src !== '' && !img.src.includes('data:'))
               .slice(0, 10); // 최대 10개 이미지만
 
             const headings = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6'))
@@ -535,16 +545,20 @@ export class CrawlerService {
         },
       }).catch(() => {}); // Ignore errors
 
+      const refinedTitle = this.refineTitle(url, pageData.title);
+      const btnObjs = pageData.buttons.map((b: any) => typeof b === 'string' ? { text: b, type: 'button' } : b);
+      const cleanButtons = this.filterButtons(btnObjs);
+
       return {
       id: pageId,
       url,
-      title: pageData.title,
+      title: refinedTitle,
       pageType,
       links: pageData.links,
       images: pageData.images,
       headings: pageData.headings,
       forms: pageData.forms,
-        buttons: pageData.buttons,
+        buttons: cleanButtons,
       textContent: pageData.textContent,
         screenshotPath,
         htmlPath: `/temp/${path.basename(outputDir)}/html/${htmlFilename}`,
@@ -590,6 +604,34 @@ export class CrawlerService {
     } catch {
       // Ignore errors
     }
+  }
+
+  private refineTitle(pageUrl: string, rawTitle: string): string {
+    const cleaned = (rawTitle || '').trim();
+    const lower = cleaned.toLowerCase();
+    if (!cleaned || lower === 'home' || lower === 'index' || lower === 'homepage') {
+      const pathname = new URL(pageUrl).pathname.replace(/\/$/, '');
+      if (!pathname || pathname === '' || pathname === '/') return 'Home';
+      const slug = pathname.split('/').filter(Boolean).pop() || 'Page';
+      return slug
+        .replace(/[-_]/g, ' ')
+        .replace(/\b\w/g, (c) => c.toUpperCase());
+    }
+    return cleaned;
+  }
+
+  // 노이즈 버튼(캐러셀·화살표 등) 제거 + 중복 제거
+  private filterButtons(buttons: { text: string; type: string }[]): { text: string; type: string }[] {
+    const noiseRegex = /(carousel|arrow|switch|index|닫기|열기|prev|next|menu)/i;
+    const uniq: { [key: string]: boolean } = {};
+    return buttons
+      .filter((b) => b.text && b.text.length >= 2 && !noiseRegex.test(b.text))
+      .filter((b) => {
+        if (uniq[b.text]) return false;
+        uniq[b.text] = true;
+        return true;
+      })
+      .slice(0, 8); // 페이지당 최대 8개 유지
   }
 
   // 무료 미리보기 - 더 빠르게!
@@ -649,9 +691,39 @@ export class CrawlerService {
           this.logger.log(`🔍 Discovering structure (${allResults.length + 1}): ${pageUrl} (depth: ${depth})`);
           
           await page.goto(pageUrl, {
-            waitUntil: 'domcontentloaded',
-            timeout: 10000 // 더 빠르게
+            waitUntil: 'load',
+            timeout: 15000
           });
+
+          // SPA 페이지의 JS 렌더링이 완료되도록 추가 대기
+          await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+          await page.waitForTimeout(1500);
+
+          // SPA 특화: 메뉴 버튼 클릭 시뮬레이션으로 추가 링크 노출
+          await page.evaluate(() => {
+            // 햄버거 메뉴, 네비게이션 버튼 등을 클릭해서 숨겨진 링크 노출
+            const menuSelectors = [
+              'button[aria-label*="menu"]',
+              'button[class*="menu"]',
+              'button[class*="nav"]',
+              '.menu-toggle',
+              '.nav-toggle',
+              '[data-toggle="menu"]',
+              '[role="button"][aria-expanded="false"]'
+            ];
+            
+            menuSelectors.forEach(selector => {
+              const elements = document.querySelectorAll(selector);
+              elements.forEach(el => {
+                try {
+                  (el as HTMLElement).click();
+                } catch {}
+              });
+            });
+          }).catch(() => {});
+
+          // 메뉴 클릭 후 DOM 업데이트 대기
+          await page.waitForTimeout(1000);
 
           // 빠른 데이터 추출 (스크린샷/HTML 없이)
           const pageData = await page.evaluate(() => {
@@ -672,22 +744,95 @@ export class CrawlerService {
               });
             });
 
-            // 링크 추출
-            const links = Array.from(document.querySelectorAll('a[href]'))
-              .map(a => {
-                const href = (a as HTMLAnchorElement).href;
+            // SPA(Next.js, Nuxt, Vue 등)에서 동적으로 생성되는 라우트를 포함해 내부 링크를 수집합니다.
+            const collectLinks = () => {
+              const urlSet = new Set<string>();
+
+              // 1) 일반 <a> 태그
+              document.querySelectorAll('a[href]').forEach((a) => {
                 try {
-                  const linkUrl = new URL(href);
-                  if (linkUrl.protocol === 'http:' || linkUrl.protocol === 'https:') {
-                    return linkUrl.toString();
+                  const href = (a as HTMLAnchorElement).href;
+                  const abs = new URL(href, location.href);
+                  if (abs.protocol.startsWith('http')) {
+                    urlSet.add(abs.toString());
                   }
                 } catch {}
-                return null;
-              })
-              .filter((link): link is string => link !== null)
-              .filter((link, index, arr) => arr.indexOf(link) === index);
+              });
 
-            // 기본 메타데이터만 추출
+              // 2) Vue / Nuxt router-link, nuxt-link
+              document.querySelectorAll('router-link[to], nuxt-link[to]').forEach((el) => {
+                const to = (el as HTMLElement).getAttribute('to');
+                if (to) {
+                  try {
+                    urlSet.add(new URL(to, location.origin).toString());
+                  } catch {}
+                }
+              });
+
+              // 3) Next.js 전역 데이터(__NEXT_DATA__)
+              try {
+                const nextData: any = (window as any).__NEXT_DATA__;
+                if (nextData) {
+                  if (typeof nextData.page === 'string') {
+                    urlSet.add(new URL(nextData.page, location.origin).toString());
+                  }
+                  const buildPages = nextData.__BUILD_MANIFEST?.sortedPages || [];
+                  (buildPages as string[]).forEach((p) => {
+                    if (p) {
+                      urlSet.add(new URL(p, location.origin).toString());
+                    }
+                  });
+                }
+              } catch {}
+
+              // 4) Nuxt.js 전역 데이터(__NUXT__)
+              try {
+                const nuxtData: any = (window as any).__NUXT__;
+                if (nuxtData && Array.isArray(nuxtData.routes)) {
+                  (nuxtData.routes as string[]).forEach((r) => {
+                    if (r) {
+                      urlSet.add(new URL(r, location.origin).toString());
+                    }
+                  });
+                }
+              } catch {}
+
+              // 5) 클릭 가능한 요소들에서 data-href, data-url 등 추출
+              document.querySelectorAll('[data-href], [data-url], [data-link]').forEach((el) => {
+                const dataHref = (el as HTMLElement).getAttribute('data-href') || 
+                                (el as HTMLElement).getAttribute('data-url') || 
+                                (el as HTMLElement).getAttribute('data-link');
+                if (dataHref) {
+                  try {
+                    urlSet.add(new URL(dataHref, location.origin).toString());
+                  } catch {}
+                }
+              });
+
+              // 6) 일반적인 SPA 라우트 패턴 추측 (현재 URL 기반)
+              const currentPath = location.pathname;
+              const commonRoutes = [
+                '/about', '/about-us', '/company',
+                '/products', '/services', '/solutions',
+                '/contact', '/contact-us', '/support',
+                '/blog', '/news', '/resources',
+                '/pricing', '/plans', '/features',
+                '/login', '/signup', '/register',
+                '/careers', '/jobs', '/team',
+                '/help', '/faq', '/documentation',
+                '/privacy', '/terms', '/legal'
+              ];
+              
+              commonRoutes.forEach(route => {
+                urlSet.add(new URL(route, location.origin).toString());
+              });
+
+              return Array.from(urlSet);
+            };
+
+            const links = collectLinks();
+
+            // 상세 메타데이터 추출
             const title = document.title || '';
             const headings = Array.from(document.querySelectorAll('h1, h2, h3'))
               .map(h => ({
@@ -697,13 +842,61 @@ export class CrawlerService {
               .filter(h => h.text.length > 0)
               .slice(0, 5);
 
+            // 버튼 정보 수집 (텍스트와 타입)
+            const buttons = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"], [role="button"]'))
+              .map(btn => {
+                const text = btn.textContent?.trim() || 
+                           (btn as HTMLInputElement).value || 
+                           btn.getAttribute('aria-label') || 
+                           btn.getAttribute('title') || 
+                           '버튼';
+                const type = btn.tagName.toLowerCase() === 'button' ? 'button' : 
+                           (btn as HTMLInputElement).type || 'button';
+                return { text: text.substring(0, 30), type };
+              })
+              .filter(btn => btn.text.length > 0)
+              .slice(0, 10);
+
+            // 이미지 정보 수집 (src, alt 포함)
+            const images = Array.from(document.querySelectorAll('img'))
+              .map(img => {
+                const imgEl = img as HTMLImageElement;
+                const srcAttr = imgEl.getAttribute('src') || imgEl.getAttribute('data-src');
+                const src = srcAttr || imgEl.src || '';
+                const alt = imgEl.alt || '';
+                const isExternal = src.startsWith('http') && !src.includes(location.hostname);
+                return { src, alt, isExternal };
+              })
+              .filter(img => img.src && img.src !== '' && !img.src.includes('data:'))
+              .slice(0, 20);
+
+            // CSS background-image에서 이미지 추출
+            const bgImages = Array.from(document.querySelectorAll('*'))
+              .map(el => {
+                const style = window.getComputedStyle(el);
+                const bgImage = style.backgroundImage;
+                if (bgImage && bgImage !== 'none' && bgImage.includes('url(')) {
+                  const match = bgImage.match(/url\(['"]?([^'"]+)['"]?\)/);
+                  if (match && match[1]) {
+                    return { src: match[1], alt: 'Background Image', isExternal: false };
+                  }
+                }
+                return null;
+              })
+              .filter(Boolean)
+              .slice(0, 5);
+
+            const allImages = [...images, ...bgImages];
+
             const textContent = document.body.textContent?.trim().substring(0, 300) || '';
             const wordCount = textContent.split(/\s+/).length;
 
             return {
               title,
-              links: links.slice(0, 15), // 링크 수 제한
+              links: links.slice(0, 30), // 링크 수 제한 확대 (SPA 지원)
               headings,
+              buttons,
+              images: allImages as { src: string; alt: string; isExternal: boolean }[],
               textContent,
               wordCount
             };
@@ -713,23 +906,27 @@ export class CrawlerService {
           const filteredLinks = filterSameDomainLinks(pageData.links);
           
           // 결과 객체 생성 (스크린샷/HTML 경로는 빈 문자열)
+          const refinedTitle = this.refineTitle(pageUrl, pageData.title);
+          const btnObjs2 = pageData.buttons.map((b: any) => typeof b === 'string' ? { text: b, type: 'button' } : b);
+          const cleanButtons = this.filterButtons(btnObjs2);
+
           const result: CrawlResult = {
             id: `preview_${Date.now()}_${allResults.length}_depth${depth}`,
             url: pageUrl,
-            title: pageData.title,
-            pageType: this.classifyPageType(pageUrl, pageData.title),
+            title: refinedTitle,
+            pageType: this.classifyPageType(pageUrl, refinedTitle),
             links: filteredLinks,
-            images: [], // 빈 배열
+            images: pageData.images,
             headings: pageData.headings,
             forms: 0,
-            buttons: [],
+            buttons: cleanButtons,
             textContent: pageData.textContent,
             screenshotPath: '', // 나중에 요청시 생성
             htmlPath: '', // 나중에 요청시 생성
             timestamp: new Date().toISOString(),
             metadata: {
               wordCount: pageData.wordCount,
-              imageCount: 0,
+              imageCount: pageData.images.length,
               linkCount: filteredLinks.length
             }
           };
@@ -861,7 +1058,7 @@ export class CrawlerService {
     }
   }
 
-  // 기존 헬퍼 메서드들은 그대로 유지
+  // 페이지와 버튼을 구분하는 네트워크 데이터 생성
   private generateNetworkData(results: CrawlResult[], sitemap: Record<string, string[]>): NetworkData {
     const nodes: NetworkNode[] = [];
     const edges: NetworkEdge[] = [];
@@ -880,19 +1077,48 @@ export class CrawlerService {
           case '서비스페이지': color = '#06b6d4'; break;
         }
         
+        // 페이지 노드 추가
         nodes.push({
-      id: result.id,
+          id: result.id,
           label: result.title.substring(0, 30) + (result.title.length > 30 ? '...' : ''),
           color,
-      type: result.pageType,
-      url: result.url,
-      title: result.title,
-      screenshot: result.screenshotPath
+          type: result.pageType,
+          url: result.url,
+          title: result.title,
+          screenshot: result.screenshotPath,
+          nodeType: 'page' as const
         });
+
+        // 해당 페이지의 버튼들을 노드로 추가
+        if (result.buttons && result.buttons.length > 0) {
+          result.buttons.forEach((button, index) => {
+            const buttonText = button.text;
+            const buttonType = button.type;
+            
+            nodes.push({
+              id: `${result.id}_button_${index}`,
+              label: buttonText,
+              color: '#6366f1', // 버튼은 보라색으로 통일
+              type: buttonType,
+              url: result.url, // 버튼이 속한 페이지 URL
+              title: `${buttonText} (${result.title})`,
+              screenshot: result.screenshotPath,
+              nodeType: 'button' as const,
+              buttonType,
+              parentPageId: result.id
+            });
+
+            // 페이지에서 버튼으로의 연결선 추가
+            edges.push({
+              from: result.id,
+              to: `${result.id}_button_${index}`
+            });
+          });
+        }
       }
     });
     
-    // Create edges based on links
+    // 페이지 간 링크 연결선 생성
     results.forEach(result => {
       result.links.forEach(link => {
         const targetResult = results.find(r => r.url === link);

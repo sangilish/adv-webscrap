@@ -1,0 +1,45 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Website Structure Visualization</title>
+    <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; }
+        #network { height: 600px; border: 1px solid #ccc; }
+        .info-panel { margin-top: 20px; padding: 15px; background: #f5f5f5; border-radius: 8px; }
+    </style>
+</head>
+<body>
+    <h1>Website Structure Analysis</h1>
+    <div id="network"></div>
+    <div class="info-panel">
+        <h3>Analysis Summary</h3>
+        <p><strong>Total Pages:</strong> 1</p>
+        <p><strong>Total Links:</strong> 0</p>
+        <p><strong>Total Images:</strong> 10</p>
+    </div>
+    
+    <script>
+        const nodes = new vis.DataSet([{"id":"page_1751520599891_0","label":"Home","color":"#ef4444","type":"홈페이지","url":"https://skywork.ai/","title":"Home","screenshot":"/temp/cmcmy521k0001v2amozs3t0xo/screenshots/page_1751520599891_0.png"}]);
+        const edges = new vis.DataSet([]);
+        const container = document.getElementById('network');
+        const data = { nodes: nodes, edges: edges };
+        const options = {
+            nodes: {
+                shape: 'dot',
+                size: 20,
+                font: { size: 12 }
+            },
+            edges: {
+                arrows: 'to'
+            },
+            physics: {
+                enabled: true,
+                stabilization: { iterations: 100 }
+            }
+        };
+        const network = new vis.Network(container, data, options);
+    </script>
+</body>
+</html>
