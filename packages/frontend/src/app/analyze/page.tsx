@@ -20,6 +20,7 @@ interface PageNode {
   }
   screenshotPath: string
   htmlPath: string
+  pageType?: string
 }
 
 interface AnalysisStats {
@@ -126,6 +127,8 @@ export default function AnalyzePage() {
   const [isCheckingAuth, setIsCheckingAuth] = useState(false)
   const [loadingPageDetails, setLoadingPageDetails] = useState(false)
   const [pageDetailsCache, setPageDetailsCache] = useState<Record<string, any>>({})
+  const [showFullNetworkMap, setShowFullNetworkMap] = useState(false)
+  const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set())
 
   useEffect(() => {
     if (!url) {
@@ -218,7 +221,8 @@ export default function AnalyzePage() {
           wordCount: result.metadata.wordCount
         },
         screenshotPath: result.screenshotPath,
-        htmlPath: result.htmlPath
+        htmlPath: result.htmlPath,
+        pageType: result.pageType
       }
       urlToNode.set(result.url, node)
     })
@@ -421,43 +425,76 @@ export default function AnalyzePage() {
   }
 
   const renderTreeNode = (node: PageNode, visited = new Set<string>()): React.ReactNode => {
-    // 순환 참조로 인한 무한 재귀 방지
-    if (visited.has(node.id)) return null;
-    visited.add(node.id);
+    if (visited.has(node.id)) {
+      return null
+    }
+    visited.add(node.id)
+
     const isSelected = selectedNode?.id === node.id
-    const indentLevel = node.depth * 20
-    
+    const hasChildren = node.children && node.children.length > 0
+    const isExpanded = expandedNodes.has(node.id)
+
+    // Extract depth from ID for proper indentation
+    const depthMatch = node.id.match(/_depth(\d+)$/)
+    const depth = depthMatch ? parseInt(depthMatch[1]) - 1 : 0
+
     return (
-      <div key={node.id}>
+      <div key={node.id} className="mb-1">
         <div
-          className={`flex items-center py-2 px-3 rounded-lg cursor-pointer transition-all ${
-            isSelected
-              ? 'bg-gradient-to-r from-purple-500 to-blue-500 text-white shadow-lg'
-              : 'hover:bg-white/60 text-gray-700'
+          className={`flex items-center py-2 px-3 rounded-lg cursor-pointer transition-all duration-200 ${
+            isSelected 
+              ? 'bg-gradient-to-r from-purple-100 to-blue-100 border-l-4 border-purple-500' 
+              : 'hover:bg-gray-50'
           }`}
-          style={{ marginLeft: `${indentLevel}px` }}
-          onClick={() => handleNodeClick(node)}
+          style={{ marginLeft: `${depth * 20}px` }}
+          onClick={() => setSelectedNode(node)}
         >
-          <div className="flex items-center flex-1">
-            {node.children.length > 0 && (
-              <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-              </svg>
-            )}
-            <div className={`w-2 h-2 rounded-full mr-3 ${
-              node.status === 'analyzed' ? 'bg-green-400' :
-              node.status === 'pending' ? 'bg-yellow-400' : 'bg-red-400'
-            }`}></div>
-            <span className="font-medium truncate">{node.title}</span>
-          </div>
-          {node.metadata && (
-            <div className="flex items-center space-x-2 text-xs">
-              <span className="bg-white/20 px-2 py-1 rounded">{node.metadata.images}img</span>
-              <span className="bg-white/20 px-2 py-1 rounded">{node.metadata.links}links</span>
-            </div>
+          {hasChildren && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation()
+                if (expandedNodes.has(node.id)) {
+                  expandedNodes.delete(node.id)
+                } else {
+                  expandedNodes.add(node.id)
+                }
+                setExpandedNodes(new Set(expandedNodes))
+              }}
+              className="mr-2 text-gray-500 hover:text-gray-700"
+            >
+              {isExpanded ? '▼' : '▶'}
+            </button>
           )}
+          <div className="flex-1">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="font-medium text-gray-800">{node.title}</span>
+                <span className="text-xs text-gray-500 bg-gray-100 px-2 py-1 rounded">
+                  {node.pageType || 'Page'}
+                </span>
+              </div>
+              <div className="flex items-center gap-3 text-xs text-gray-600">
+                <span className="flex items-center gap-1">
+                  <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                  </svg>
+                  {node.metadata?.images || 0}
+                </span>
+                <span className="flex items-center gap-1">
+                  <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
+                  </svg>
+                  {node.metadata?.links || 0}
+                </span>
+              </div>
+            </div>
+          </div>
         </div>
-        {node.children.map(child => renderTreeNode(child, visited))}
+        {hasChildren && isExpanded && (
+          <div>
+            {node.children.map(child => renderTreeNode(child, visited))}
+          </div>
+        )}
       </div>
     )
   }
@@ -1069,12 +1106,29 @@ export default function AnalyzePage() {
                 <div className="p-4 overflow-y-auto h-[520px]">
                   {viewMode === 'structure' ? (
                     <div>
-                  {siteMap.map(node => renderTreeNode(node))}
-                </div>
+                      {siteMap.length > 0 ? (
+                        siteMap.map(node => renderTreeNode(node))
+                      ) : (
+                        <div className="flex items-center justify-center h-full text-gray-500">
+                          사이트 구조를 로드하는 중...
+                        </div>
+                      )}
+                    </div>
                   ) : (
-                    <div className="h-full">
+                    <div className="h-full relative">
                       {result && result.networkData ? (
-                        <NetworkVisualization networkData={result.networkData} />
+                        <>
+                          <NetworkVisualization networkData={result.networkData} />
+                          <button
+                            onClick={() => setShowFullNetworkMap(true)}
+                            className="absolute top-4 right-4 bg-white/90 backdrop-blur-sm px-3 py-1.5 rounded-lg shadow-lg hover:shadow-xl transition-all text-sm font-medium text-gray-700 hover:text-purple-600"
+                          >
+                            <svg className="w-4 h-4 inline mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" />
+                            </svg>
+                            전체보기
+                          </button>
+                        </>
                       ) : (
                         <div className="flex items-center justify-center h-full text-gray-500">
                           네트워크 데이터를 로드하는 중...
@@ -1281,6 +1335,30 @@ export default function AnalyzePage() {
               >
                 Maybe later
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Full Network Map Modal */}
+      {showFullNetworkMap && result?.networkData && (
+        <div className="fixed inset-0 bg-black/90 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-3xl shadow-2xl w-full h-full max-w-7xl max-h-[90vh] flex flex-col">
+            <div className="p-6 border-b border-gray-200 flex items-center justify-between">
+              <h3 className="text-2xl font-bold text-gray-800">Network Map - Full View</h3>
+              <button
+                onClick={() => setShowFullNetworkMap(false)}
+                className="p-2 hover:bg-gray-100 rounded-lg transition-colors"
+              >
+                <svg className="w-6 h-6 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+            <div className="flex-1 p-6 overflow-hidden">
+              <div className="w-full h-full">
+                <NetworkVisualization networkData={result.networkData} />
+              </div>
             </div>
           </div>
         </div>
