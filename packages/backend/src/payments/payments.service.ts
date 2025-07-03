@@ -17,7 +17,7 @@ export class PaymentsService {
   ) {
     const stripeSecretKey = this.configService.get<string>('STRIPE_SECRET_KEY') || 'sk_test_YOUR_STRIPE_SECRET_KEY_HERE';
     this.stripe = new Stripe(stripeSecretKey, {
-      apiVersion: '2024-12-18.acacia',
+      apiVersion: '2024-12-18.acacia' as Stripe.LatestApiVersion,
     });
     this.logger.log('Stripe initialized successfully');
   }

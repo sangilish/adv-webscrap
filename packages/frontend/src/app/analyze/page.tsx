@@ -80,9 +80,10 @@ interface NetworkNode {
   url: string;
   title: string;
   screenshot: string;
-  nodeType: 'page' | 'button';
-  buttonType?: string;
+  nodeType: 'page' | 'menu' | 'button' | 'form';
+  elementType?: string; // 'main-menu', 'sub-menu', 'footer-menu', 'submit-button', etc.
   parentPageId?: string;
+  depth?: number;
 }
 
 interface NetworkEdge {
@@ -474,75 +475,77 @@ export default function AnalyzePage() {
       const container = document.getElementById('network-container')
       if (!container) return
 
-      // 페이지 노드와 버튼 노드 분리
+      // 노드 타입별로 분리
       const pageNodes = networkData.nodes.filter(node => node.nodeType === 'page')
+      const menuNodes = networkData.nodes.filter(node => node.nodeType === 'menu')
       const buttonNodes = networkData.nodes.filter(node => node.nodeType === 'button')
+      const formNodes = networkData.nodes.filter(node => node.nodeType === 'form')
 
       // 페이지 노드를 depth별로 그룹화
       const pagesByDepth = pageNodes.reduce((acc, node) => {
-        const depthMatch = node.id.match(/depth(\d+)/)
-        const depth = depthMatch ? parseInt(depthMatch[1]) : 0
+        const depth = node.depth || 0
         if (!acc[depth]) acc[depth] = []
         acc[depth].push(node)
         return acc
       }, {} as Record<number, typeof pageNodes>)
 
       const maxDepth = Math.max(...Object.keys(pagesByDepth).map(Number))
-      const svgWidth = Math.max(1400, (maxDepth + 1) * 350) // 버튼 공간 고려하여 더 넓게
-      const svgHeight = 900
+      const svgWidth = Math.max(1600, (maxDepth + 1) * 400)
+      const svgHeight = Math.max(1000, Math.max(...Object.values(pagesByDepth).map((nodes: any) => nodes.length)) * 150)
       
-      // 페이지 노드 레이아웃 계산 (왼쪽에서 오른쪽으로)
+      // 페이지 노드 레이아웃 계산
       const pageNodesWithLayout = pageNodes.map(node => {
-        const depthMatch = node.id.match(/depth(\d+)/)
-        const depth = depthMatch ? parseInt(depthMatch[1]) : 0
+        const depth = node.depth || 0
         const nodesAtDepth = pagesByDepth[depth]
         const indexAtDepth = nodesAtDepth.indexOf(node)
         const totalAtDepth = nodesAtDepth.length
         
-        // 페이지는 각 depth의 왼쪽에 배치
-        const x = 100 + depth * 350
+        const x = 150 + depth * 400
         const y = (svgHeight / (totalAtDepth + 1)) * (indexAtDepth + 1)
         
-        return {
-          ...node,
-          x,
-          y,
-          depth,
-          nodeType: 'page' as const
-        }
+        return { ...node, x, y }
       })
 
-      // 버튼 노드 레이아웃 계산 (해당 페이지 오른쪽에 배치)
-      const buttonNodesWithLayout = buttonNodes.map(button => {
-        const parentPage = pageNodesWithLayout.find(page => page.id === button.parentPageId)
+      // 요소 노드들의 레이아웃 계산
+      const elementNodesWithLayout = [...menuNodes, ...buttonNodes, ...formNodes].map(element => {
+        const parentPage = pageNodesWithLayout.find(page => page.id === element.parentPageId)
         if (!parentPage) return null
 
-        // 해당 페이지의 버튼들 찾기
-        const siblingButtons = buttonNodes.filter(btn => btn.parentPageId === button.parentPageId)
-        const buttonIndex = siblingButtons.indexOf(button)
+        // 같은 부모를 가진 요소들 찾기
+        const siblingElements = [...menuNodes, ...buttonNodes, ...formNodes]
+          .filter(el => el.parentPageId === element.parentPageId)
+        const elementIndex = siblingElements.indexOf(element)
         
-        // 페이지 오른쪽에 버튼들을 세로로 배치
-        const x = parentPage.x + 120 // 페이지 오른쪽
-        const y = parentPage.y - 40 + (buttonIndex * 25) // 페이지 위아래로 버튼 배치
+        // 요소 타입별로 다른 위치에 배치
+        let offsetX = 0
+        let offsetY = 0
+        
+        if (element.nodeType === 'menu') {
+          offsetX = 150 // 페이지 오른쪽
+          offsetY = -40 + (elementIndex * 25)
+        } else if (element.nodeType === 'button') {
+          offsetX = 180 // 메뉴보다 더 오른쪽
+          offsetY = -20 + (elementIndex * 20)
+        } else if (element.nodeType === 'form') {
+          offsetX = 120 // 페이지 아래쪽
+          offsetY = 40
+        }
         
         return {
-          ...button,
-          x,
-          y,
-          depth: parentPage.depth,
-          nodeType: 'button' as const
+          ...element,
+          x: parentPage.x + offsetX,
+          y: parentPage.y + offsetY,
+          depth: parentPage.depth
         }
       }).filter(Boolean)
 
-      const allNodes = [...pageNodesWithLayout, ...buttonNodesWithLayout]
+      const allNodes = [...pageNodesWithLayout, ...elementNodesWithLayout]
       
       container.innerHTML = `
         <div class="bg-white border rounded-lg overflow-hidden">
-          <!-- 네트워크 맵 헤더 -->
           <div class="p-4 border-b bg-gray-50 flex justify-between items-center">
-            <h3 class="text-lg font-semibold">웹사이트 계층 구조 (왼쪽→오른쪽)</h3>
+            <h3 class="text-lg font-semibold">웹사이트 구조 맵 (페이지 → 메뉴/버튼/폼)</h3>
             
-            <!-- 컨트롤 버튼들 -->
             <div class="flex items-center gap-2">
               <button id="zoom-in" class="p-2 bg-blue-500 text-white rounded hover:bg-blue-600 transition-colors" title="확대">
                 <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -563,9 +566,8 @@ export default function AnalyzePage() {
             </div>
           </div>
 
-          <!-- 스크롤 가능한 네트워크 맵 영역 -->
           <div class="relative">
-            <div id="network-viewport" class="overflow-auto" style="height: 400px; cursor: grab;">
+            <div id="network-viewport" class="overflow-auto" style="height: 500px; cursor: grab;">
               <svg id="network-svg" width="${svgWidth}" height="${svgHeight}" 
                    style="background: linear-gradient(to right, #f8fafc, #f1f5f9); min-width: ${svgWidth}px;">
                 <defs>
@@ -576,36 +578,16 @@ export default function AnalyzePage() {
                   <filter id="drop-shadow">
                     <feDropShadow dx="2" dy="2" stdDeviation="3" flood-opacity="0.3"/>
                   </filter>
-                  <linearGradient id="depth0" x1="0%" y1="0%" x2="100%" y2="100%">
-                    <stop offset="0%" style="stop-color:#ef4444;stop-opacity:1" />
-                    <stop offset="100%" style="stop-color:#dc2626;stop-opacity:1" />
-                  </linearGradient>
-                  <linearGradient id="depth1" x1="0%" y1="0%" x2="100%" y2="100%">
-                    <stop offset="0%" style="stop-color:#f97316;stop-opacity:1" />
-                    <stop offset="100%" style="stop-color:#ea580c;stop-opacity:1" />
-                  </linearGradient>
-                  <linearGradient id="depth2" x1="0%" y1="0%" x2="100%" y2="100%">
-                    <stop offset="0%" style="stop-color:#eab308;stop-opacity:1" />
-                    <stop offset="100%" style="stop-color:#ca8a04;stop-opacity:1" />
-                  </linearGradient>
-                  <linearGradient id="depth3" x1="0%" y1="0%" x2="100%" y2="100%">
-                    <stop offset="0%" style="stop-color:#22c55e;stop-opacity:1" />
-                    <stop offset="100%" style="stop-color:#16a34a;stop-opacity:1" />
-                  </linearGradient>
-                  <linearGradient id="depth4" x1="0%" y1="0%" x2="100%" y2="100%">
-                    <stop offset="0%" style="stop-color:#3b82f6;stop-opacity:1" />
-                    <stop offset="100%" style="stop-color:#2563eb;stop-opacity:1" />
-                  </linearGradient>
                 </defs>
                 
-                <!-- Depth 레이블 및 구분선 (세로선) -->
+                <!-- Depth 구분선 -->
                 ${Array.from({length: maxDepth + 1}, (_, depth) => `
                   <g>
-                    <line x1="${150 + depth * 280 - 50}" y1="0" x2="${150 + depth * 280 - 50}" y2="${svgHeight}" 
+                    <line x1="${150 + depth * 400 - 50}" y1="0" x2="${150 + depth * 400 - 50}" y2="${svgHeight}" 
                           stroke="#e5e7eb" stroke-width="1" stroke-dasharray="5,5" opacity="0.5" />
-                    <rect x="${150 + depth * 280 - 90}" y="20" width="80" height="25" 
+                    <rect x="${150 + depth * 400 - 90}" y="20" width="80" height="25" 
                           fill="rgba(255,255,255,0.9)" stroke="#d1d5db" rx="12" />
-                    <text x="${150 + depth * 280 - 50}" y="37" 
+                    <text x="${150 + depth * 400 - 50}" y="37" 
                           text-anchor="middle" 
                           fill="#374151" 
                           font-size="12" 
@@ -621,22 +603,32 @@ export default function AnalyzePage() {
                   const toNode = allNodes.find((n: any) => n.id === edge.to)
                   if (!fromNode || !toNode) return ''
                   
+                  // 연결선 스타일을 노드 타입에 따라 다르게
+                  let strokeColor = '#94a3b8'
+                  let strokeWidth = 2
+                  
+                  if (fromNode.nodeType === 'page' && toNode.nodeType === 'menu') {
+                    strokeColor = '#3b82f6' // 파란색
+                  } else if (fromNode.nodeType === 'page' && toNode.nodeType === 'button') {
+                    strokeColor = '#a855f7' // 보라색
+                  } else if (fromNode.nodeType === 'page' && toNode.nodeType === 'form') {
+                    strokeColor = '#fbbf24' // 노란색
+                  }
+                  
                   return `
-                    <line x1="${fromNode.x + 35}" y1="${fromNode.y}" x2="${toNode.x - 35}" y2="${toNode.y}" 
-                          stroke="#94a3b8" stroke-width="2" marker-end="url(#arrowhead)" opacity="0.6" />
+                    <line x1="${fromNode.x + 50}" y1="${fromNode.y}" x2="${toNode.x - 30}" y2="${toNode.y}" 
+                          stroke="${strokeColor}" stroke-width="${strokeWidth}" marker-end="url(#arrowhead)" opacity="0.6" />
                   `
                 }).join('')}
                 
-                <!-- 노드 -->
-                ${allNodes.map((node: any, index: number) => {
+                <!-- 노드 렌더링 -->
+                ${allNodes.map((node: any) => {
+                  // 페이지 노드
                   if (node.nodeType === 'page') {
-                    const depthColor = `depth${Math.min(node.depth, 4)}`
                     return `
-                      <g class="node-group page-node" data-id="${node.id}" style="cursor: pointer;" 
-                         onmouseover="this.style.transform='scale(1.05)'" 
-                         onmouseout="this.style.transform='scale(1)'">
-                        <rect x="${node.x - 50}" y="${node.y - 30}" width="100" height="60" 
-                              fill="url(#${depthColor})" 
+                      <g class="node-group page-node" data-id="${node.id}" style="cursor: pointer;">
+                        <rect x="${node.x - 60}" y="${node.y - 30}" width="120" height="60" 
+                              fill="${node.color}" 
                               stroke="#ffffff" 
                               stroke-width="3" 
                               rx="8"
@@ -644,41 +636,74 @@ export default function AnalyzePage() {
                         <text x="${node.x}" y="${node.y - 8}" 
                               text-anchor="middle" 
                               fill="white" 
-                              font-size="10" 
+                              font-size="11" 
                               font-weight="bold">
                           ${node.type}
                         </text>
-                        <text x="${node.x}" y="${node.y + 6}" 
+                        <text x="${node.x}" y="${node.y + 8}" 
                               text-anchor="middle" 
                               fill="white" 
-                              font-size="8">
-                          D${node.depth}
-                        </text>
-                        <text x="${node.x}" y="${node.y + 45}" 
-                              text-anchor="middle" 
-                              fill="#374151" 
-                              font-size="9" 
-                              font-weight="500">
-                          ${node.label.length > 15 ? node.label.substring(0, 15) + '...' : node.label}
+                              font-size="9">
+                          ${node.label.length > 20 ? node.label.substring(0, 20) + '...' : node.label}
                         </text>
                       </g>
                     `
-                  } else if (node.nodeType === 'button') {
+                  }
+                  // 메뉴 노드
+                  else if (node.nodeType === 'menu') {
                     return `
-                      <g class="node-group button-node" data-id="${node.id}" style="cursor: pointer;" 
-                         onmouseover="this.style.transform='scale(1.1)'" 
-                         onmouseout="this.style.transform='scale(1)'">
-                        <ellipse cx="${node.x}" cy="${node.y}" rx="25" ry="12" 
-                                fill="#6366f1" 
+                      <g class="node-group menu-node" data-id="${node.id}" style="cursor: pointer;">
+                        <rect x="${node.x - 40}" y="${node.y - 12}" width="80" height="24" 
+                              fill="${node.color}" 
+                              stroke="#ffffff" 
+                              stroke-width="2" 
+                              rx="12"
+                              filter="url(#drop-shadow)" />
+                        <text x="${node.x}" y="${node.y + 3}" 
+                              text-anchor="middle" 
+                              fill="white" 
+                              font-size="9" 
+                              font-weight="600">
+                          📋 ${node.label.length > 12 ? node.label.substring(0, 12) + '...' : node.label}
+                        </text>
+                      </g>
+                    `
+                  }
+                  // 버튼 노드
+                  else if (node.nodeType === 'button') {
+                    return `
+                      <g class="node-group button-node" data-id="${node.id}" style="cursor: pointer;">
+                        <ellipse cx="${node.x}" cy="${node.y}" rx="35" ry="15" 
+                                fill="${node.color}" 
                                 stroke="#ffffff" 
                                 stroke-width="2" 
                                 filter="url(#drop-shadow)" />
-                        <text x="${node.x}" y="${node.y + 2}" 
+                        <text x="${node.x}" y="${node.y + 3}" 
                               text-anchor="middle" 
                               fill="white" 
-                              font-size="8" 
+                              font-size="9" 
                               font-weight="600">
-                          ${node.label.length > 8 ? node.label.substring(0, 8) + '...' : node.label}
+                          🔘 ${node.label.length > 10 ? node.label.substring(0, 10) + '...' : node.label}
+                        </text>
+                      </g>
+                    `
+                  }
+                  // 폼 노드
+                  else if (node.nodeType === 'form') {
+                    return `
+                      <g class="node-group form-node" data-id="${node.id}" style="cursor: pointer;">
+                        <rect x="${node.x - 45}" y="${node.y - 15}" width="90" height="30" 
+                              fill="${node.color}" 
+                              stroke="#ffffff" 
+                              stroke-width="2" 
+                              rx="4"
+                              filter="url(#drop-shadow)" />
+                        <text x="${node.x}" y="${node.y + 3}" 
+                              text-anchor="middle" 
+                              fill="#7c2d12" 
+                              font-size="9" 
+                              font-weight="600">
+                          📝 ${node.label.length > 12 ? node.label.substring(0, 12) + '...' : node.label}
                         </text>
                       </g>
                     `
@@ -690,69 +715,61 @@ export default function AnalyzePage() {
           </div>
         </div>
         
-        <!-- 고정된 분석 섹션 -->
+        <!-- 통계 및 범례 -->
         <div class="mt-4 bg-white border rounded-lg p-4">
-          <h4 class="font-semibold text-gray-900 mb-3">분석 통계</h4>
+          <h4 class="font-semibold text-gray-900 mb-3">구조 분석 통계</h4>
           <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div class="bg-gray-50 p-4 rounded">
-              <h5 class="font-medium text-gray-900 mb-2">계층 통계</h5>
+              <h5 class="font-medium text-gray-900 mb-2">페이지 통계</h5>
               <div class="space-y-1 text-sm text-gray-700">
+                <div>총 페이지: ${pageNodes.length}개</div>
                 <div>최대 깊이: ${maxDepth}단계</div>
-                <div>총 페이지: ${pageNodesWithLayout.length}개</div>
-                <div>총 버튼: ${buttonNodesWithLayout.length}개</div>
-                <div>총 연결: ${networkData.edges.length}개</div>
-              </div>
-            </div>
-            
-            <div class="bg-gray-50 p-4 rounded">
-              <h5 class="font-medium text-gray-900 mb-2">Depth별 분포</h5>
-              <div class="space-y-1 text-sm">
-                ${Object.entries(pagesByDepth).map(([depth, depthPages]: [string, any]) => `
-                  <div class="flex items-center justify-between">
-                    <span class="text-gray-700">Depth ${depth}:</span>
-                    <span class="font-medium">${depthPages.length}개 페이지</span>
-                  </div>
+                ${Object.entries(pagesByDepth).map(([depth, pages]: [string, any]) => `
+                  <div>Depth ${depth}: ${pages.length}개</div>
                 `).join('')}
               </div>
             </div>
             
             <div class="bg-gray-50 p-4 rounded">
-              <h5 class="font-medium text-gray-900 mb-2">노드 유형별</h5>
+              <h5 class="font-medium text-gray-900 mb-2">요소 통계</h5>
               <div class="space-y-1 text-sm">
                 <div class="flex items-center justify-between">
-                  <span class="text-gray-700">📄 페이지:</span>
-                  <span class="font-medium">${pageNodesWithLayout.length}개</span>
+                  <span class="text-gray-700">📋 메뉴:</span>
+                  <span class="font-medium">${menuNodes.length}개</span>
                 </div>
                 <div class="flex items-center justify-between">
                   <span class="text-gray-700">🔘 버튼:</span>
-                  <span class="font-medium">${buttonNodesWithLayout.length}개</span>
+                  <span class="font-medium">${buttonNodes.length}개</span>
+                </div>
+                <div class="flex items-center justify-between">
+                  <span class="text-gray-700">📝 폼:</span>
+                  <span class="font-medium">${formNodes.length}개</span>
                 </div>
               </div>
             </div>
-          </div>
-          
-          <!-- Depth별 색상 범례 -->
-          <div class="mt-4 pt-4 border-t">
-            <h5 class="font-medium text-gray-900 mb-2">Depth 색상 범례</h5>
-            <div class="flex flex-wrap gap-3">
-              ${Array.from({length: maxDepth + 1}, (_, i) => `
+            
+            <div class="bg-gray-50 p-4 rounded">
+              <h5 class="font-medium text-gray-900 mb-2">색상 범례</h5>
+              <div class="space-y-1 text-sm">
                 <div class="flex items-center gap-2">
-                  <div class="w-4 h-4 rounded" style="background: linear-gradient(135deg, 
-                    ${i === 0 ? '#ef4444, #dc2626' : 
-                      i === 1 ? '#f97316, #ea580c' : 
-                      i === 2 ? '#eab308, #ca8a04' : 
-                      i === 3 ? '#22c55e, #16a34a' : 
-                      '#3b82f6, #2563eb'}
-                  )"></div>
-                  <span class="text-sm text-gray-700">Depth ${i} (${pagesByDepth[i]?.length || 0}개)</span>
+                  <div class="w-4 h-4 rounded" style="background: #3b82f6"></div>
+                  <span>메인 메뉴</span>
                 </div>
-              `).join('')}
+                <div class="flex items-center gap-2">
+                  <div class="w-4 h-4 rounded" style="background: #a855f7"></div>
+                  <span>버튼</span>
+                </div>
+                <div class="flex items-center gap-2">
+                  <div class="w-4 h-4 rounded" style="background: #fbbf24"></div>
+                  <span>폼</span>
+                </div>
+              </div>
             </div>
           </div>
         </div>
       `
       
-      // 확대/축소/리셋 버튼 이벤트
+      // 줌/팬 이벤트 핸들러 설정
       const zoomInBtn = container.querySelector('#zoom-in')
       const zoomOutBtn = container.querySelector('#zoom-out')
       const resetBtn = container.querySelector('#reset-view')
@@ -765,7 +782,6 @@ export default function AnalyzePage() {
         if (svg) {
           svg.style.transform = `scale(${clampedZoom}) translate(${panX}px, ${panY}px)`
         }
-        // 줌 퍼센트 업데이트
         const zoomText = container.querySelector('.text-sm.text-gray-600')
         if (zoomText) {
           zoomText.textContent = `${Math.round(clampedZoom * 100)}%`
@@ -782,52 +798,9 @@ export default function AnalyzePage() {
         if (svg) {
           svg.style.transform = 'scale(1) translate(0px, 0px)'
         }
-        if (viewport) {
-          viewport.scrollLeft = 0
-          viewport.scrollTop = 0
-        }
       })
       
-      // 드래그 이벤트 (팬)
-      let isDraggingLocal = false
-      let dragStartLocal = { x: 0, y: 0 }
-      
-      viewport?.addEventListener('mousedown', (e) => {
-        isDraggingLocal = true
-        dragStartLocal = { x: e.clientX - panX, y: e.clientY - panY }
-        viewport.style.cursor = 'grabbing'
-      })
-      
-      viewport?.addEventListener('mousemove', (e) => {
-        if (!isDraggingLocal) return
-        e.preventDefault()
-        const newPanX = e.clientX - dragStartLocal.x
-        const newPanY = e.clientY - dragStartLocal.y
-        setPanX(newPanX)
-        setPanY(newPanY)
-        if (svg) {
-          svg.style.transform = `scale(${zoom}) translate(${newPanX}px, ${newPanY}px)`
-        }
-      })
-      
-      viewport?.addEventListener('mouseup', () => {
-        isDraggingLocal = false
-        viewport.style.cursor = 'grab'
-      })
-      
-      viewport?.addEventListener('mouseleave', () => {
-        isDraggingLocal = false
-        viewport.style.cursor = 'grab'
-      })
-      
-      // 휠 줌
-      viewport?.addEventListener('wheel', (e) => {
-        e.preventDefault()
-        const delta = e.deltaY > 0 ? 0.9 : 1.1
-        updateZoom(zoom * delta)
-      })
-      
-      // 노드 클릭 이벤트 추가
+      // 노드 클릭 이벤트
       const nodeGroups = container.querySelectorAll('.node-group')
       nodeGroups.forEach(nodeGroup => {
         nodeGroup.addEventListener('click', (e) => {
@@ -835,7 +808,6 @@ export default function AnalyzePage() {
           const clickedNode = networkData.nodes.find(n => n.id === nodeId)
           if (clickedNode) {
             console.log('Clicked node:', clickedNode)
-            // 여기에 노드 클릭 시 추가 동작을 구현할 수 있습니다
           }
         })
       })
@@ -1240,7 +1212,7 @@ export default function AnalyzePage() {
                   ) : (
                     <div className="text-center py-12">
                       <svg className="w-16 h-16 text-gray-400 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2V6a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
                       </svg>
                       <p className="text-gray-500">Select a page from the structure map to view details</p>
                     </div>

@@ -28,6 +28,11 @@ export interface CrawlResult {
     imageCount: number;
     linkCount: number;
   };
+  elements?: {
+    menus: { text: string; href: string; type: 'main' | 'sub' | 'footer' }[];
+    buttons: { text: string; type: string; action?: string; href?: string }[];
+    forms: { name: string; action: string; fields: number }[];
+  };
 }
 
 export interface NetworkNode {
@@ -38,9 +43,10 @@ export interface NetworkNode {
     url: string;
     title: string;
     screenshot: string;
-    nodeType: 'page' | 'button';
-    buttonType?: string;
+    nodeType: 'page' | 'menu' | 'button' | 'form';
+    elementType?: string; // 'main-menu', 'sub-menu', 'footer-menu', 'submit-button', etc.
     parentPageId?: string;
+    depth?: number;
 }
 
 export interface NetworkEdge {
@@ -243,7 +249,7 @@ export class CrawlerService {
             },
             html_path: htmlPath
           });
-        } catch (error) {
+    } catch (error) {
           this.logger.warn('Failed to update Supabase analysis:', error.message);
         }
       }
@@ -340,7 +346,7 @@ export class CrawlerService {
             }
           }
 
-        } catch (error) {
+      } catch (error) {
           this.logger.warn(`Failed to discover URLs from ${currentUrl}: ${error.message}`);
         }
       }
@@ -386,7 +392,7 @@ export class CrawlerService {
           const result = await this.fastCrawlPage(page, url, outputDir, index, urls.length, analysisId);
           results.push(result);
           return result;
-        } catch (error) {
+      } catch (error) {
           this.logger.error(`Failed to crawl ${url}:`, error);
           return null;
         } finally {
@@ -434,50 +440,264 @@ export class CrawlerService {
       const [pageData, _] = await Promise.all([
         page.evaluate((baseUrl) => {
           try {
-            // Extract links
-      const links = Array.from(document.querySelectorAll('a[href]'))
-        .map(a => (a as HTMLAnchorElement).href)
-              .filter(href => href.startsWith('http') && !href.includes('#'))
-              .slice(0, 20); // 최대 20개 링크만
+            // 메뉴 수집 함수 - 네비게이션 메뉴를 정확히 식별
+            const collectMenus = () => {
+              const menus: { text: string; href: string; type: 'main' | 'sub' | 'footer' }[] = [];
+              
+              // 메인 네비게이션 메뉴
+              const mainNavSelectors = [
+                'nav a', 'header a', '[role="navigation"] a',
+                '.nav a', '.navbar a', '.menu a', '.navigation a',
+                '[class*="nav-"] a', '[class*="menu-"] a'
+              ];
+              
+              mainNavSelectors.forEach(selector => {
+                document.querySelectorAll(selector).forEach(el => {
+                  const link = el as HTMLAnchorElement;
+                  const text = link.textContent?.trim() || '';
+                  const href = link.href || '';
+                  
+                  if (text && href && !href.includes('#') && text.length > 1) {
+                    // 중복 제거
+                    const exists = menus.some(m => m.text === text && m.href === href);
+                    if (!exists) {
+                      menus.push({ text, href, type: 'main' });
+                    }
+                  }
+                });
+              });
+              
+              // 푸터 메뉴
+              const footerSelectors = ['footer a', '.footer a', '[class*="footer"] a'];
+              footerSelectors.forEach(selector => {
+                document.querySelectorAll(selector).forEach(el => {
+                  const link = el as HTMLAnchorElement;
+                  const text = link.textContent?.trim() || '';
+                  const href = link.href || '';
+                  
+                  if (text && href && !href.includes('#') && text.length > 1) {
+                    const exists = menus.some(m => m.text === text && m.href === href);
+                    if (!exists) {
+                      menus.push({ text, href, type: 'footer' });
+                    }
+                  }
+                });
+              });
+              
+              return menus;
+            };
 
-            // Extract other data
-      const images = Array.from(document.querySelectorAll('img[src]'))
-        .map(img => {
-          const imgEl = img as HTMLImageElement;
-          const srcAttr = imgEl.getAttribute('src') || imgEl.getAttribute('data-src');
-          const src = srcAttr || imgEl.src || '';
-          const alt = imgEl.alt || '';
-          const isExternal = src.startsWith('http') && !src.includes(location.hostname);
-          return { src, alt, isExternal };
-        })
+            // 버튼 수집 함수 - 실제 버튼 텍스트와 기능 식별
+            const collectButtons = () => {
+              const buttons: { text: string; type: string; action?: string; href?: string }[] = [];
+              
+              // 버튼 요소들
+              const buttonElements = document.querySelectorAll(
+                'button, input[type="button"], input[type="submit"], [role="button"], a.btn, a.button'
+              );
+              
+              buttonElements.forEach(el => {
+                let text = '';
+                let type = 'button';
+                let action = '';
+                let href = '';
+                
+                if (el.tagName === 'BUTTON') {
+                  text = el.textContent?.trim() || '';
+                  type = (el as HTMLButtonElement).type || 'button';
+                } else if (el.tagName === 'INPUT') {
+                  const input = el as HTMLInputElement;
+                  text = input.value || input.placeholder || '';
+                  type = input.type;
+                } else if (el.tagName === 'A') {
+                  const link = el as HTMLAnchorElement;
+                  text = link.textContent?.trim() || '';
+                  href = link.href || '';
+                  type = 'link-button';
+                } else {
+                  text = el.textContent?.trim() || el.getAttribute('aria-label') || '';
+                }
+                
+                // onclick 속성에서 action 추출
+                const onclick = el.getAttribute('onclick');
+                if (onclick) {
+                  action = onclick.substring(0, 50);
+                }
+                
+                // 노이즈 필터링
+                if (text && text.length > 0 && text.length < 50 && 
+                    !text.match(/^[\s\n]*$/) && 
+                    !text.toLowerCase().includes('cookie')) {
+                  buttons.push({ text, type, action, href });
+                }
+              });
+              
+              return buttons;
+            };
+
+            // 폼 수집 함수
+            const collectForms = () => {
+              const forms: { name: string; action: string; fields: number }[] = [];
+              
+              document.querySelectorAll('form').forEach(form => {
+                const name = form.getAttribute('name') || 
+                            form.getAttribute('id') || 
+                            form.querySelector('h1, h2, h3, h4')?.textContent?.trim() ||
+                            '폼';
+                const action = form.action || '';
+                const fields = form.querySelectorAll('input, textarea, select').length;
+                
+                forms.push({ name, action, fields });
+              });
+              
+              return forms;
+            };
+
+            // SPA(Next.js, Nuxt, Vue 등)에서 동적으로 생성되는 라우트를 포함해 내부 링크를 수집합니다.
+            const collectLinks = () => {
+              const urlSet = new Set<string>();
+
+              // 1) 일반 <a> 태그
+              document.querySelectorAll('a[href]').forEach((a) => {
+                try {
+                  const href = (a as HTMLAnchorElement).href;
+                  const abs = new URL(href, location.href);
+                  if (abs.protocol.startsWith('http')) {
+                    urlSet.add(abs.toString());
+                  }
+                } catch {}
+              });
+
+              // 2) Vue / Nuxt router-link, nuxt-link
+              document.querySelectorAll('router-link[to], nuxt-link[to]').forEach((el) => {
+                const to = (el as HTMLElement).getAttribute('to');
+                if (to) {
+                  try {
+                    urlSet.add(new URL(to, location.origin).toString());
+                  } catch {}
+                }
+              });
+
+              // 3) Next.js 전역 데이터(__NEXT_DATA__)
+              try {
+                const nextData: any = (window as any).__NEXT_DATA__;
+                if (nextData) {
+                  if (typeof nextData.page === 'string') {
+                    urlSet.add(new URL(nextData.page, location.origin).toString());
+                  }
+                  const buildPages = nextData.__BUILD_MANIFEST?.sortedPages || [];
+                  (buildPages as string[]).forEach((p) => {
+                    if (p) {
+                      urlSet.add(new URL(p, location.origin).toString());
+                    }
+                  });
+                }
+              } catch {}
+
+              // 4) Nuxt.js 전역 데이터(__NUXT__)
+              try {
+                const nuxtData: any = (window as any).__NUXT__;
+                if (nuxtData && Array.isArray(nuxtData.routes)) {
+                  (nuxtData.routes as string[]).forEach((r) => {
+                    if (r) {
+                      urlSet.add(new URL(r, location.origin).toString());
+                    }
+                  });
+                }
+              } catch {}
+
+              // 5) 클릭 가능한 요소들에서 data-href, data-url 등 추출
+              document.querySelectorAll('[data-href], [data-url], [data-link]').forEach((el) => {
+                const dataHref = (el as HTMLElement).getAttribute('data-href') || 
+                                (el as HTMLElement).getAttribute('data-url') || 
+                                (el as HTMLElement).getAttribute('data-link');
+                if (dataHref) {
+                  try {
+                    urlSet.add(new URL(dataHref, location.origin).toString());
+                  } catch {}
+                }
+              });
+
+              // 6) 일반적인 SPA 라우트 패턴 추측 (현재 URL 기반)
+              const currentPath = location.pathname;
+              const commonRoutes = [
+                '/about', '/about-us', '/company',
+                '/products', '/services', '/solutions',
+                '/contact', '/contact-us', '/support',
+                '/blog', '/news', '/resources',
+                '/pricing', '/plans', '/features',
+                '/login', '/signup', '/register',
+                '/careers', '/jobs', '/team',
+                '/help', '/faq', '/documentation',
+                '/privacy', '/terms', '/legal'
+              ];
+              
+              commonRoutes.forEach(route => {
+                urlSet.add(new URL(route, location.origin).toString());
+              });
+
+              return Array.from(urlSet);
+            };
+
+            const links = collectLinks();
+            const menus = collectMenus();
+            const buttons = collectButtons();
+            const forms = collectForms();
+
+            // 상세 메타데이터 추출
+            const title = document.title || '';
+            const headings = Array.from(document.querySelectorAll('h1, h2, h3'))
+              .map(h => ({
+                level: h.tagName.toLowerCase(),
+                text: h.textContent?.trim() || ''
+              }))
+              .filter(h => h.text.length > 0)
+              .slice(0, 5);
+
+            // 이미지 정보 수집 (src, alt 포함)
+            const images = Array.from(document.querySelectorAll('img'))
+              .map(img => {
+                const imgEl = img as HTMLImageElement;
+                const srcAttr = imgEl.getAttribute('src') || imgEl.getAttribute('data-src');
+                const src = srcAttr || imgEl.src || '';
+                const alt = imgEl.alt || '';
+                const isExternal = src.startsWith('http') && !src.includes(location.hostname);
+                return { src, alt, isExternal };
+              })
               .filter(img => img.src && img.src !== '' && !img.src.includes('data:'))
-              .slice(0, 10); // 최대 10개 이미지만
+              .slice(0, 20);
 
-            const headings = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6'))
-              .slice(0, 20) // Limit headings
-        .map(h => ({
-          level: h.tagName.toLowerCase(),
-          text: h.textContent?.trim() || ''
-              }));
+            // CSS background-image에서 이미지 추출
+            const bgImages = Array.from(document.querySelectorAll('*'))
+              .map(el => {
+                const style = window.getComputedStyle(el);
+                const bgImage = style.backgroundImage;
+                if (bgImage && bgImage !== 'none' && bgImage.includes('url(')) {
+                  const match = bgImage.match(/url\(['"]?([^'"]+)['"]?\)/);
+                  if (match && match[1]) {
+                    return { src: match[1], alt: 'Background Image', isExternal: false };
+                  }
+                }
+                return null;
+              })
+              .filter(Boolean)
+              .slice(0, 5);
 
-      const forms = document.querySelectorAll('form').length;
-            const buttons = Array.from(document.querySelectorAll('button'))
-              .slice(0, 10)
-              .map(btn => btn.textContent?.trim() || '')
-              .filter(t => t);
+            const allImages = [...images, ...bgImages];
 
-            // Get text content (limited)
-            const textContent = document.body?.innerText?.slice(0, 5000) || '';
-      
+            const textContent = document.body.textContent?.trim().substring(0, 300) || '';
+            const wordCount = textContent.split(/\s+/).length;
+
       return {
-              title: document.title || '',
-        links,
-        images,
-        headings,
-        forms,
+              title,
+              links: links.slice(0, 30), // 링크 수 제한 확대 (SPA 지원)
+              headings,
+              menus,
               buttons,
+              forms,
+              images: allImages as { src: string; alt: string; isExternal: boolean }[],
               textContent,
-              wordCount: textContent.split(/\s+/).length
+              wordCount
             };
           } catch (error) {
             console.error('Error in page evaluation:', error);
@@ -557,7 +777,7 @@ export class CrawlerService {
       links: pageData.links,
       images: pageData.images,
       headings: pageData.headings,
-      forms: pageData.forms,
+      forms: Array.isArray(pageData.forms) ? pageData.forms.length : typeof pageData.forms === 'number' ? pageData.forms : 0,
         buttons: cleanButtons,
       textContent: pageData.textContent,
         screenshotPath,
@@ -681,7 +901,7 @@ export class CrawlerService {
         if (visited.has(pageUrl)) return;
         visited.add(pageUrl);
 
-        const context = await browser.newContext({
+    const context = await browser.newContext({
           userAgent: 'Mozilla/5.0 (compatible; WebCrawler/1.0)',
           viewport: { width: 1280, height: 800 }
         });
@@ -727,7 +947,7 @@ export class CrawlerService {
 
           // 빠른 데이터 추출 (스크린샷/HTML 없이)
           const pageData = await page.evaluate(() => {
-            // 쿠키 팝업 제거
+          // 쿠키 팝업 제거
             const cookieSelectors = [
               '[class*="cookie"]', '[id*="cookie"]',
               '[class*="consent"]', '[id*="consent"]',
@@ -743,6 +963,119 @@ export class CrawlerService {
                 }
               });
             });
+
+            // 메뉴 수집 함수 - 네비게이션 메뉴를 정확히 식별
+            const collectMenus = () => {
+              const menus: { text: string; href: string; type: 'main' | 'sub' | 'footer' }[] = [];
+              
+              // 메인 네비게이션 메뉴
+              const mainNavSelectors = [
+                'nav a', 'header a', '[role="navigation"] a',
+                '.nav a', '.navbar a', '.menu a', '.navigation a',
+                '[class*="nav-"] a', '[class*="menu-"] a'
+              ];
+              
+              mainNavSelectors.forEach(selector => {
+                document.querySelectorAll(selector).forEach(el => {
+                  const link = el as HTMLAnchorElement;
+                  const text = link.textContent?.trim() || '';
+                  const href = link.href || '';
+                  
+                  if (text && href && !href.includes('#') && text.length > 1) {
+                    // 중복 제거
+                    const exists = menus.some(m => m.text === text && m.href === href);
+                    if (!exists) {
+                      menus.push({ text, href, type: 'main' });
+                    }
+                  }
+                });
+              });
+              
+              // 푸터 메뉴
+              const footerSelectors = ['footer a', '.footer a', '[class*="footer"] a'];
+              footerSelectors.forEach(selector => {
+                document.querySelectorAll(selector).forEach(el => {
+                  const link = el as HTMLAnchorElement;
+                  const text = link.textContent?.trim() || '';
+                  const href = link.href || '';
+                  
+                  if (text && href && !href.includes('#') && text.length > 1) {
+                    const exists = menus.some(m => m.text === text && m.href === href);
+                    if (!exists) {
+                      menus.push({ text, href, type: 'footer' });
+                    }
+                  }
+                });
+              });
+              
+              return menus;
+            };
+
+            // 버튼 수집 함수 - 실제 버튼 텍스트와 기능 식별
+            const collectButtons = () => {
+              const buttons: { text: string; type: string; action?: string; href?: string }[] = [];
+              
+              // 버튼 요소들
+              const buttonElements = document.querySelectorAll(
+                'button, input[type="button"], input[type="submit"], [role="button"], a.btn, a.button'
+              );
+              
+              buttonElements.forEach(el => {
+                let text = '';
+                let type = 'button';
+                let action = '';
+                let href = '';
+                
+                if (el.tagName === 'BUTTON') {
+                  text = el.textContent?.trim() || '';
+                  type = (el as HTMLButtonElement).type || 'button';
+                } else if (el.tagName === 'INPUT') {
+                  const input = el as HTMLInputElement;
+                  text = input.value || input.placeholder || '';
+                  type = input.type;
+                } else if (el.tagName === 'A') {
+                  const link = el as HTMLAnchorElement;
+                  text = link.textContent?.trim() || '';
+                  href = link.href || '';
+                  type = 'link-button';
+                } else {
+                  text = el.textContent?.trim() || el.getAttribute('aria-label') || '';
+                }
+                
+                // onclick 속성에서 action 추출
+                const onclick = el.getAttribute('onclick');
+                if (onclick) {
+                  action = onclick.substring(0, 50);
+                }
+                
+                // 노이즈 필터링
+                if (text && text.length > 0 && text.length < 50 && 
+                    !text.match(/^[\s\n]*$/) && 
+                    !text.toLowerCase().includes('cookie')) {
+                  buttons.push({ text, type, action, href });
+                }
+              });
+              
+              return buttons;
+            };
+
+            // 폼 수집 함수
+            const collectForms = () => {
+              const forms: { name: string; action: string; fields: number }[] = [];
+              
+              document.querySelectorAll('form').forEach(form => {
+                const name = form.getAttribute('name') || 
+                            form.getAttribute('id') || 
+                            form.querySelector('h1, h2, h3, h4')?.textContent?.trim() ||
+                            '폼';
+                const action = form.action || '';
+                const fields = form.querySelectorAll('input, textarea, select').length;
+                
+                forms.push({ name, action, fields });
+              });
+              
+              return forms;
+            };
 
             // SPA(Next.js, Nuxt, Vue 등)에서 동적으로 생성되는 라우트를 포함해 내부 링크를 수집합니다.
             const collectLinks = () => {
@@ -831,6 +1164,9 @@ export class CrawlerService {
             };
 
             const links = collectLinks();
+            const menus = collectMenus();
+            const buttons = collectButtons();
+            const forms = collectForms();
 
             // 상세 메타데이터 추출
             const title = document.title || '';
@@ -841,21 +1177,6 @@ export class CrawlerService {
               }))
               .filter(h => h.text.length > 0)
               .slice(0, 5);
-
-            // 버튼 정보 수집 (텍스트와 타입)
-            const buttons = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"], [role="button"]'))
-              .map(btn => {
-                const text = btn.textContent?.trim() || 
-                           (btn as HTMLInputElement).value || 
-                           btn.getAttribute('aria-label') || 
-                           btn.getAttribute('title') || 
-                           '버튼';
-                const type = btn.tagName.toLowerCase() === 'button' ? 'button' : 
-                           (btn as HTMLInputElement).type || 'button';
-                return { text: text.substring(0, 30), type };
-              })
-              .filter(btn => btn.text.length > 0)
-              .slice(0, 10);
 
             // 이미지 정보 수집 (src, alt 포함)
             const images = Array.from(document.querySelectorAll('img'))
@@ -891,11 +1212,13 @@ export class CrawlerService {
             const textContent = document.body.textContent?.trim().substring(0, 300) || '';
             const wordCount = textContent.split(/\s+/).length;
 
-            return {
+      return {
               title,
               links: links.slice(0, 30), // 링크 수 제한 확대 (SPA 지원)
               headings,
+              menus,
               buttons,
+              forms,
               images: allImages as { src: string; alt: string; isExternal: boolean }[],
               textContent,
               wordCount
@@ -918,7 +1241,7 @@ export class CrawlerService {
             links: filteredLinks,
             images: pageData.images,
             headings: pageData.headings,
-            forms: 0,
+            forms: Array.isArray(pageData.forms) ? pageData.forms.length : typeof pageData.forms === 'number' ? pageData.forms : 0,
             buttons: cleanButtons,
             textContent: pageData.textContent,
             screenshotPath: '', // 나중에 요청시 생성
@@ -928,6 +1251,12 @@ export class CrawlerService {
               wordCount: pageData.wordCount,
               imageCount: pageData.images.length,
               linkCount: filteredLinks.length
+            },
+            // 구조화된 요소 정보 추가
+            elements: {
+              menus: pageData.menus || [],
+              buttons: pageData.buttons || [],
+              forms: pageData.forms || []
             }
           };
 
@@ -968,7 +1297,7 @@ export class CrawlerService {
 
       this.logger.log(`✅ Structure discovery completed! (총 ${allResults.length} 페이지)`);
       this.logger.log(`=== getPreviewAnalysis END ===`);
-
+      
       return {
         results: allResults,
         networkData,
@@ -990,12 +1319,50 @@ export class CrawlerService {
     const urlLower = url.toLowerCase();
     const titleLower = title.toLowerCase();
 
-    if (urlLower.includes('/contact') || titleLower.includes('contact')) return '연락처';
-    if (urlLower.includes('/about') || titleLower.includes('about')) return '소개페이지';
-    if (urlLower.includes('/product') || titleLower.includes('product')) return '제품페이지';
-    if (urlLower.includes('/service') || titleLower.includes('service')) return '서비스페이지';
-    if (urlLower.includes('/blog') || titleLower.includes('blog')) return '블로그';
-    if (urlLower.includes('/news') || titleLower.includes('news')) return '뉴스';
+    // URL 경로 분석
+    const pathname = new URL(url).pathname.toLowerCase();
+    
+    // 홈페이지
+    if (pathname === '/' || pathname === '/index' || pathname === '/home') return '홈페이지';
+    
+    // 인증 관련
+    if (pathname.includes('/login') || pathname.includes('/signin')) return '로그인';
+    if (pathname.includes('/signup') || pathname.includes('/register')) return '회원가입';
+    if (pathname.includes('/logout') || pathname.includes('/signout')) return '로그아웃';
+    
+    // 정보 페이지
+    if (pathname.includes('/about') || titleLower.includes('about')) return '소개페이지';
+    if (pathname.includes('/contact') || titleLower.includes('contact')) return '연락처';
+    if (pathname.includes('/company') || titleLower.includes('company')) return '회사정보';
+    if (pathname.includes('/team') || titleLower.includes('team')) return '팀소개';
+    
+    // 제품/서비스
+    if (pathname.includes('/product') || titleLower.includes('product')) return '제품페이지';
+    if (pathname.includes('/service') || titleLower.includes('service')) return '서비스페이지';
+    if (pathname.includes('/solution') || titleLower.includes('solution')) return '솔루션';
+    if (pathname.includes('/pricing') || titleLower.includes('pricing')) return '가격정책';
+    if (pathname.includes('/plans') || titleLower.includes('plan')) return '요금제';
+    if (pathname.includes('/features') || titleLower.includes('feature')) return '기능소개';
+    
+    // 콘텐츠
+    if (pathname.includes('/blog') || titleLower.includes('blog')) return '블로그';
+    if (pathname.includes('/news') || titleLower.includes('news')) return '뉴스';
+    if (pathname.includes('/article') || titleLower.includes('article')) return '기사';
+    if (pathname.includes('/resource') || titleLower.includes('resource')) return '자료실';
+    if (pathname.includes('/documentation') || pathname.includes('/docs')) return '문서';
+    
+    // 지원
+    if (pathname.includes('/support') || titleLower.includes('support')) return '고객지원';
+    if (pathname.includes('/help') || titleLower.includes('help')) return '도움말';
+    if (pathname.includes('/faq') || titleLower.includes('faq')) return 'FAQ';
+    
+    // 채용
+    if (pathname.includes('/career') || pathname.includes('/jobs')) return '채용정보';
+    
+    // 법률/정책
+    if (pathname.includes('/privacy') || titleLower.includes('privacy')) return '개인정보처리방침';
+    if (pathname.includes('/terms') || titleLower.includes('terms')) return '이용약관';
+    if (pathname.includes('/legal') || titleLower.includes('legal')) return '법적고지';
     
     return '일반페이지';
   }
@@ -1022,7 +1389,7 @@ export class CrawlerService {
         waitUntil: 'domcontentloaded',
         timeout: 30000
       });
-
+      
       // 쿠키 팝업 제거
       await this.quickRemoveCookies(page);
 
@@ -1064,65 +1431,203 @@ export class CrawlerService {
     const edges: NetworkEdge[] = [];
     const processedUrls = new Set<string>();
     
+    // 색상 정의
+    const pageColors = {
+      '홈페이지': '#ef4444',         // 빨강
+      '소개페이지': '#10b981',       // 초록
+      '회사정보': '#10b981',         // 초록
+      '팀소개': '#10b981',           // 초록
+      '연락처': '#f59e0b',           // 주황
+      '제품페이지': '#8b5cf6',       // 보라
+      '서비스페이지': '#06b6d4',     // 하늘색
+      '솔루션': '#06b6d4',           // 하늘색
+      '가격정책': '#ec4899',         // 핑크
+      '요금제': '#ec4899',           // 핑크
+      '기능소개': '#8b5cf6',         // 보라
+      '블로그': '#f97316',           // 오렌지
+      '뉴스': '#f97316',             // 오렌지
+      '자료실': '#f97316',           // 오렌지
+      '문서': '#6366f1',             // 인디고
+      '고객지원': '#14b8a6',         // 청록
+      '도움말': '#14b8a6',           // 청록
+      'FAQ': '#14b8a6',              // 청록
+      '로그인': '#64748b',           // 회색
+      '회원가입': '#64748b',         // 회색
+      '채용정보': '#84cc16',         // 라임
+      '개인정보처리방침': '#94a3b8', // 연회색
+      '이용약관': '#94a3b8',         // 연회색
+      '법적고지': '#94a3b8',         // 연회색
+      '일반페이지': '#6b7280'        // 회색
+    };
+    
+    const elementColors = {
+      'main-menu': '#3b82f6',        // 파랑 - 메인 메뉴
+      'sub-menu': '#60a5fa',         // 연파랑 - 서브 메뉴
+      'footer-menu': '#93c5fd',      // 밝은 파랑 - 푸터 메뉴
+      'button': '#a855f7',           // 보라 - 일반 버튼
+      'submit': '#7c3aed',           // 진한 보라 - 제출 버튼
+      'link-button': '#c084fc',      // 연보라 - 링크 버튼
+      'form': '#fbbf24'              // 노랑 - 폼
+    };
+    
+    // Depth별로 결과 그룹화
+    const resultsByDepth: { [depth: number]: CrawlResult[] } = {};
+    results.forEach(result => {
+      const depthMatch = result.id.match(/depth(\d+)/);
+      const depth = depthMatch ? parseInt(depthMatch[1]) : 0;
+      if (!resultsByDepth[depth]) resultsByDepth[depth] = [];
+      resultsByDepth[depth].push(result);
+    });
+    
     results.forEach((result) => {
       if (!processedUrls.has(result.url)) {
         processedUrls.add(result.url);
         
-        let color = '#6366f1';
-        switch (result.pageType) {
-          case '홈페이지': color = '#ef4444'; break;
-          case '소개페이지': color = '#10b981'; break;
-          case '연락처': color = '#f59e0b'; break;
-          case '제품페이지': color = '#8b5cf6'; break;
-          case '서비스페이지': color = '#06b6d4'; break;
-        }
+        const depthMatch = result.id.match(/depth(\d+)/);
+        const depth = depthMatch ? parseInt(depthMatch[1]) : 0;
+        
+        // 페이지 색상 선택
+        const pageColor = pageColors[result.pageType] || pageColors['일반페이지'];
         
         // 페이지 노드 추가
         nodes.push({
           id: result.id,
-          label: result.title.substring(0, 30) + (result.title.length > 30 ? '...' : ''),
-          color,
+          label: result.title.substring(0, 40) + (result.title.length > 40 ? '...' : ''),
+          color: pageColor,
           type: result.pageType,
           url: result.url,
           title: result.title,
           screenshot: result.screenshotPath,
-          nodeType: 'page' as const
+          nodeType: 'page' as const,
+          depth
         });
 
-        // 해당 페이지의 버튼들을 노드로 추가
-        if (result.buttons && result.buttons.length > 0) {
-          result.buttons.forEach((button, index) => {
-            const buttonText = button.text;
-            const buttonType = button.type;
+        // 메뉴 노드 추가
+        if (result.elements?.menus && result.elements.menus.length > 0) {
+          result.elements.menus.forEach((menu, index) => {
+            const menuId = `${result.id}_menu_${index}`;
+            const menuColor = menu.type === 'main' ? elementColors['main-menu'] :
+                            menu.type === 'footer' ? elementColors['footer-menu'] :
+                            elementColors['sub-menu'];
             
             nodes.push({
-              id: `${result.id}_button_${index}`,
-              label: buttonText,
-              color: '#6366f1', // 버튼은 보라색으로 통일
-              type: buttonType,
-              url: result.url, // 버튼이 속한 페이지 URL
-              title: `${buttonText} (${result.title})`,
-              screenshot: result.screenshotPath,
-              nodeType: 'button' as const,
-              buttonType,
-              parentPageId: result.id
+              id: menuId,
+              label: menu.text,
+              color: menuColor,
+              type: `${menu.type}-menu`,
+              url: menu.href,
+              title: `${menu.text} (${result.title})`,
+              screenshot: '',
+              nodeType: 'menu' as const,
+              elementType: `${menu.type}-menu`,
+              parentPageId: result.id,
+              depth
             });
 
-            // 페이지에서 버튼으로의 연결선 추가
+            // 페이지에서 메뉴로의 연결선
             edges.push({
               from: result.id,
-              to: `${result.id}_button_${index}`
+              to: menuId
+            });
+            
+            // 메뉴가 가리키는 페이지로의 연결선
+            const targetPage = results.find(r => r.url === menu.href);
+            if (targetPage) {
+              edges.push({
+                from: menuId,
+                to: targetPage.id
+              });
+            }
+          });
+        }
+
+        // 버튼 노드 추가 (중요한 버튼만)
+        if (result.elements?.buttons && result.elements.buttons.length > 0) {
+          // 중요한 버튼만 필터링
+          const importantButtons = result.elements.buttons.filter(btn => {
+            const text = btn.text.toLowerCase();
+            return !text.includes('cookie') && 
+                   !text.includes('accept') && 
+                   !text.includes('decline') &&
+                   !text.includes('×') &&
+                   !text.includes('x') &&
+                   text.length > 2 &&
+                   text.length < 30;
+          }).slice(0, 5); // 최대 5개만
+          
+          importantButtons.forEach((button, index) => {
+            const buttonId = `${result.id}_button_${index}`;
+            const buttonColor = button.type === 'submit' ? elementColors['submit'] :
+                              button.type === 'link-button' ? elementColors['link-button'] :
+                              elementColors['button'];
+            
+            nodes.push({
+              id: buttonId,
+              label: button.text,
+              color: buttonColor,
+              type: button.type,
+              url: button.href || result.url,
+              title: `${button.text} (${result.title})`,
+              screenshot: '',
+              nodeType: 'button' as const,
+              elementType: button.type,
+              parentPageId: result.id,
+              depth
+            });
+
+            // 페이지에서 버튼으로의 연결선
+            edges.push({
+              from: result.id,
+              to: buttonId
+            });
+            
+            // 링크 버튼이 가리키는 페이지로의 연결선
+            if (button.href) {
+              const targetPage = results.find(r => r.url === button.href);
+              if (targetPage) {
+                edges.push({
+                  from: buttonId,
+                  to: targetPage.id
+                });
+              }
+            }
+          });
+        }
+
+        // 폼 노드 추가
+        if (result.elements?.forms && result.elements.forms.length > 0) {
+          result.elements.forms.forEach((form, index) => {
+            const formId = `${result.id}_form_${index}`;
+            
+            nodes.push({
+              id: formId,
+              label: `${form.name} (${form.fields} fields)`,
+              color: elementColors['form'],
+              type: 'form',
+              url: result.url,
+              title: `${form.name} Form (${result.title})`,
+              screenshot: '',
+              nodeType: 'form' as const,
+              elementType: 'form',
+              parentPageId: result.id,
+              depth
+            });
+
+            // 페이지에서 폼으로의 연결선
+            edges.push({
+              from: result.id,
+              to: formId
             });
           });
         }
       }
     });
     
-    // 페이지 간 링크 연결선 생성
+    // 페이지 간 링크 연결선 생성 (이미 메뉴/버튼으로 연결되지 않은 경우만)
     results.forEach(result => {
       result.links.forEach(link => {
         const targetResult = results.find(r => r.url === link);
-        if (targetResult) {
+        if (targetResult && !edges.some(e => e.from === result.id && e.to === targetResult.id)) {
           edges.push({
             from: result.id,
             to: targetResult.id

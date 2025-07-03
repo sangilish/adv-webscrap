@@ -271,11 +271,181 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
             const [pageData, _] = await Promise.all([
                 page.evaluate((baseUrl) => {
                     try {
-                        const links = Array.from(document.querySelectorAll('a[href]'))
-                            .map(a => a.href)
-                            .filter(href => href.startsWith('http') && !href.includes('#'))
-                            .slice(0, 20);
-                        const images = Array.from(document.querySelectorAll('img[src]'))
+                        const collectMenus = () => {
+                            const menus = [];
+                            const mainNavSelectors = [
+                                'nav a', 'header a', '[role="navigation"] a',
+                                '.nav a', '.navbar a', '.menu a', '.navigation a',
+                                '[class*="nav-"] a', '[class*="menu-"] a'
+                            ];
+                            mainNavSelectors.forEach(selector => {
+                                document.querySelectorAll(selector).forEach(el => {
+                                    const link = el;
+                                    const text = link.textContent?.trim() || '';
+                                    const href = link.href || '';
+                                    if (text && href && !href.includes('#') && text.length > 1) {
+                                        const exists = menus.some(m => m.text === text && m.href === href);
+                                        if (!exists) {
+                                            menus.push({ text, href, type: 'main' });
+                                        }
+                                    }
+                                });
+                            });
+                            const footerSelectors = ['footer a', '.footer a', '[class*="footer"] a'];
+                            footerSelectors.forEach(selector => {
+                                document.querySelectorAll(selector).forEach(el => {
+                                    const link = el;
+                                    const text = link.textContent?.trim() || '';
+                                    const href = link.href || '';
+                                    if (text && href && !href.includes('#') && text.length > 1) {
+                                        const exists = menus.some(m => m.text === text && m.href === href);
+                                        if (!exists) {
+                                            menus.push({ text, href, type: 'footer' });
+                                        }
+                                    }
+                                });
+                            });
+                            return menus;
+                        };
+                        const collectButtons = () => {
+                            const buttons = [];
+                            const buttonElements = document.querySelectorAll('button, input[type="button"], input[type="submit"], [role="button"], a.btn, a.button');
+                            buttonElements.forEach(el => {
+                                let text = '';
+                                let type = 'button';
+                                let action = '';
+                                let href = '';
+                                if (el.tagName === 'BUTTON') {
+                                    text = el.textContent?.trim() || '';
+                                    type = el.type || 'button';
+                                }
+                                else if (el.tagName === 'INPUT') {
+                                    const input = el;
+                                    text = input.value || input.placeholder || '';
+                                    type = input.type;
+                                }
+                                else if (el.tagName === 'A') {
+                                    const link = el;
+                                    text = link.textContent?.trim() || '';
+                                    href = link.href || '';
+                                    type = 'link-button';
+                                }
+                                else {
+                                    text = el.textContent?.trim() || el.getAttribute('aria-label') || '';
+                                }
+                                const onclick = el.getAttribute('onclick');
+                                if (onclick) {
+                                    action = onclick.substring(0, 50);
+                                }
+                                if (text && text.length > 0 && text.length < 50 &&
+                                    !text.match(/^[\s\n]*$/) &&
+                                    !text.toLowerCase().includes('cookie')) {
+                                    buttons.push({ text, type, action, href });
+                                }
+                            });
+                            return buttons;
+                        };
+                        const collectForms = () => {
+                            const forms = [];
+                            document.querySelectorAll('form').forEach(form => {
+                                const name = form.getAttribute('name') ||
+                                    form.getAttribute('id') ||
+                                    form.querySelector('h1, h2, h3, h4')?.textContent?.trim() ||
+                                    '폼';
+                                const action = form.action || '';
+                                const fields = form.querySelectorAll('input, textarea, select').length;
+                                forms.push({ name, action, fields });
+                            });
+                            return forms;
+                        };
+                        const collectLinks = () => {
+                            const urlSet = new Set();
+                            document.querySelectorAll('a[href]').forEach((a) => {
+                                try {
+                                    const href = a.href;
+                                    const abs = new URL(href, location.href);
+                                    if (abs.protocol.startsWith('http')) {
+                                        urlSet.add(abs.toString());
+                                    }
+                                }
+                                catch { }
+                            });
+                            document.querySelectorAll('router-link[to], nuxt-link[to]').forEach((el) => {
+                                const to = el.getAttribute('to');
+                                if (to) {
+                                    try {
+                                        urlSet.add(new URL(to, location.origin).toString());
+                                    }
+                                    catch { }
+                                }
+                            });
+                            try {
+                                const nextData = window.__NEXT_DATA__;
+                                if (nextData) {
+                                    if (typeof nextData.page === 'string') {
+                                        urlSet.add(new URL(nextData.page, location.origin).toString());
+                                    }
+                                    const buildPages = nextData.__BUILD_MANIFEST?.sortedPages || [];
+                                    buildPages.forEach((p) => {
+                                        if (p) {
+                                            urlSet.add(new URL(p, location.origin).toString());
+                                        }
+                                    });
+                                }
+                            }
+                            catch { }
+                            try {
+                                const nuxtData = window.__NUXT__;
+                                if (nuxtData && Array.isArray(nuxtData.routes)) {
+                                    nuxtData.routes.forEach((r) => {
+                                        if (r) {
+                                            urlSet.add(new URL(r, location.origin).toString());
+                                        }
+                                    });
+                                }
+                            }
+                            catch { }
+                            document.querySelectorAll('[data-href], [data-url], [data-link]').forEach((el) => {
+                                const dataHref = el.getAttribute('data-href') ||
+                                    el.getAttribute('data-url') ||
+                                    el.getAttribute('data-link');
+                                if (dataHref) {
+                                    try {
+                                        urlSet.add(new URL(dataHref, location.origin).toString());
+                                    }
+                                    catch { }
+                                }
+                            });
+                            const currentPath = location.pathname;
+                            const commonRoutes = [
+                                '/about', '/about-us', '/company',
+                                '/products', '/services', '/solutions',
+                                '/contact', '/contact-us', '/support',
+                                '/blog', '/news', '/resources',
+                                '/pricing', '/plans', '/features',
+                                '/login', '/signup', '/register',
+                                '/careers', '/jobs', '/team',
+                                '/help', '/faq', '/documentation',
+                                '/privacy', '/terms', '/legal'
+                            ];
+                            commonRoutes.forEach(route => {
+                                urlSet.add(new URL(route, location.origin).toString());
+                            });
+                            return Array.from(urlSet);
+                        };
+                        const links = collectLinks();
+                        const menus = collectMenus();
+                        const buttons = collectButtons();
+                        const forms = collectForms();
+                        const title = document.title || '';
+                        const headings = Array.from(document.querySelectorAll('h1, h2, h3'))
+                            .map(h => ({
+                            level: h.tagName.toLowerCase(),
+                            text: h.textContent?.trim() || ''
+                        }))
+                            .filter(h => h.text.length > 0)
+                            .slice(0, 5);
+                        const images = Array.from(document.querySelectorAll('img'))
                             .map(img => {
                             const imgEl = img;
                             const srcAttr = imgEl.getAttribute('src') || imgEl.getAttribute('data-src');
@@ -285,28 +455,34 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
                             return { src, alt, isExternal };
                         })
                             .filter(img => img.src && img.src !== '' && !img.src.includes('data:'))
-                            .slice(0, 10);
-                        const headings = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6'))
-                            .slice(0, 20)
-                            .map(h => ({
-                            level: h.tagName.toLowerCase(),
-                            text: h.textContent?.trim() || ''
-                        }));
-                        const forms = document.querySelectorAll('form').length;
-                        const buttons = Array.from(document.querySelectorAll('button'))
-                            .slice(0, 10)
-                            .map(btn => btn.textContent?.trim() || '')
-                            .filter(t => t);
-                        const textContent = document.body?.innerText?.slice(0, 5000) || '';
+                            .slice(0, 20);
+                        const bgImages = Array.from(document.querySelectorAll('*'))
+                            .map(el => {
+                            const style = window.getComputedStyle(el);
+                            const bgImage = style.backgroundImage;
+                            if (bgImage && bgImage !== 'none' && bgImage.includes('url(')) {
+                                const match = bgImage.match(/url\(['"]?([^'"]+)['"]?\)/);
+                                if (match && match[1]) {
+                                    return { src: match[1], alt: 'Background Image', isExternal: false };
+                                }
+                            }
+                            return null;
+                        })
+                            .filter(Boolean)
+                            .slice(0, 5);
+                        const allImages = [...images, ...bgImages];
+                        const textContent = document.body.textContent?.trim().substring(0, 300) || '';
+                        const wordCount = textContent.split(/\s+/).length;
                         return {
-                            title: document.title || '',
-                            links,
-                            images,
+                            title,
+                            links: links.slice(0, 30),
                             headings,
-                            forms,
+                            menus,
                             buttons,
+                            forms,
+                            images: allImages,
                             textContent,
-                            wordCount: textContent.split(/\s+/).length
+                            wordCount
                         };
                     }
                     catch (error) {
@@ -375,7 +551,7 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
                 links: pageData.links,
                 images: pageData.images,
                 headings: pageData.headings,
-                forms: pageData.forms,
+                forms: Array.isArray(pageData.forms) ? pageData.forms.length : typeof pageData.forms === 'number' ? pageData.forms : 0,
                 buttons: cleanButtons,
                 textContent: pageData.textContent,
                 screenshotPath,
@@ -532,6 +708,93 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
                                 }
                             });
                         });
+                        const collectMenus = () => {
+                            const menus = [];
+                            const mainNavSelectors = [
+                                'nav a', 'header a', '[role="navigation"] a',
+                                '.nav a', '.navbar a', '.menu a', '.navigation a',
+                                '[class*="nav-"] a', '[class*="menu-"] a'
+                            ];
+                            mainNavSelectors.forEach(selector => {
+                                document.querySelectorAll(selector).forEach(el => {
+                                    const link = el;
+                                    const text = link.textContent?.trim() || '';
+                                    const href = link.href || '';
+                                    if (text && href && !href.includes('#') && text.length > 1) {
+                                        const exists = menus.some(m => m.text === text && m.href === href);
+                                        if (!exists) {
+                                            menus.push({ text, href, type: 'main' });
+                                        }
+                                    }
+                                });
+                            });
+                            const footerSelectors = ['footer a', '.footer a', '[class*="footer"] a'];
+                            footerSelectors.forEach(selector => {
+                                document.querySelectorAll(selector).forEach(el => {
+                                    const link = el;
+                                    const text = link.textContent?.trim() || '';
+                                    const href = link.href || '';
+                                    if (text && href && !href.includes('#') && text.length > 1) {
+                                        const exists = menus.some(m => m.text === text && m.href === href);
+                                        if (!exists) {
+                                            menus.push({ text, href, type: 'footer' });
+                                        }
+                                    }
+                                });
+                            });
+                            return menus;
+                        };
+                        const collectButtons = () => {
+                            const buttons = [];
+                            const buttonElements = document.querySelectorAll('button, input[type="button"], input[type="submit"], [role="button"], a.btn, a.button');
+                            buttonElements.forEach(el => {
+                                let text = '';
+                                let type = 'button';
+                                let action = '';
+                                let href = '';
+                                if (el.tagName === 'BUTTON') {
+                                    text = el.textContent?.trim() || '';
+                                    type = el.type || 'button';
+                                }
+                                else if (el.tagName === 'INPUT') {
+                                    const input = el;
+                                    text = input.value || input.placeholder || '';
+                                    type = input.type;
+                                }
+                                else if (el.tagName === 'A') {
+                                    const link = el;
+                                    text = link.textContent?.trim() || '';
+                                    href = link.href || '';
+                                    type = 'link-button';
+                                }
+                                else {
+                                    text = el.textContent?.trim() || el.getAttribute('aria-label') || '';
+                                }
+                                const onclick = el.getAttribute('onclick');
+                                if (onclick) {
+                                    action = onclick.substring(0, 50);
+                                }
+                                if (text && text.length > 0 && text.length < 50 &&
+                                    !text.match(/^[\s\n]*$/) &&
+                                    !text.toLowerCase().includes('cookie')) {
+                                    buttons.push({ text, type, action, href });
+                                }
+                            });
+                            return buttons;
+                        };
+                        const collectForms = () => {
+                            const forms = [];
+                            document.querySelectorAll('form').forEach(form => {
+                                const name = form.getAttribute('name') ||
+                                    form.getAttribute('id') ||
+                                    form.querySelector('h1, h2, h3, h4')?.textContent?.trim() ||
+                                    '폼';
+                                const action = form.action || '';
+                                const fields = form.querySelectorAll('input, textarea, select').length;
+                                forms.push({ name, action, fields });
+                            });
+                            return forms;
+                        };
                         const collectLinks = () => {
                             const urlSet = new Set();
                             document.querySelectorAll('a[href]').forEach((a) => {
@@ -608,6 +871,9 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
                             return Array.from(urlSet);
                         };
                         const links = collectLinks();
+                        const menus = collectMenus();
+                        const buttons = collectButtons();
+                        const forms = collectForms();
                         const title = document.title || '';
                         const headings = Array.from(document.querySelectorAll('h1, h2, h3'))
                             .map(h => ({
@@ -616,19 +882,6 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
                         }))
                             .filter(h => h.text.length > 0)
                             .slice(0, 5);
-                        const buttons = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"], [role="button"]'))
-                            .map(btn => {
-                            const text = btn.textContent?.trim() ||
-                                btn.value ||
-                                btn.getAttribute('aria-label') ||
-                                btn.getAttribute('title') ||
-                                '버튼';
-                            const type = btn.tagName.toLowerCase() === 'button' ? 'button' :
-                                btn.type || 'button';
-                            return { text: text.substring(0, 30), type };
-                        })
-                            .filter(btn => btn.text.length > 0)
-                            .slice(0, 10);
                         const images = Array.from(document.querySelectorAll('img'))
                             .map(img => {
                             const imgEl = img;
@@ -661,7 +914,9 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
                             title,
                             links: links.slice(0, 30),
                             headings,
+                            menus,
                             buttons,
+                            forms,
                             images: allImages,
                             textContent,
                             wordCount
@@ -679,7 +934,7 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
                         links: filteredLinks,
                         images: pageData.images,
                         headings: pageData.headings,
-                        forms: 0,
+                        forms: Array.isArray(pageData.forms) ? pageData.forms.length : typeof pageData.forms === 'number' ? pageData.forms : 0,
                         buttons: cleanButtons,
                         textContent: pageData.textContent,
                         screenshotPath: '',
@@ -689,6 +944,11 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
                             wordCount: pageData.wordCount,
                             imageCount: pageData.images.length,
                             linkCount: filteredLinks.length
+                        },
+                        elements: {
+                            menus: pageData.menus || [],
+                            buttons: pageData.buttons || [],
+                            forms: pageData.forms || []
                         }
                     };
                     allResults.push(result);
@@ -735,18 +995,59 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
     classifyPageType(url, title) {
         const urlLower = url.toLowerCase();
         const titleLower = title.toLowerCase();
-        if (urlLower.includes('/contact') || titleLower.includes('contact'))
-            return '연락처';
-        if (urlLower.includes('/about') || titleLower.includes('about'))
+        const pathname = new URL(url).pathname.toLowerCase();
+        if (pathname === '/' || pathname === '/index' || pathname === '/home')
+            return '홈페이지';
+        if (pathname.includes('/login') || pathname.includes('/signin'))
+            return '로그인';
+        if (pathname.includes('/signup') || pathname.includes('/register'))
+            return '회원가입';
+        if (pathname.includes('/logout') || pathname.includes('/signout'))
+            return '로그아웃';
+        if (pathname.includes('/about') || titleLower.includes('about'))
             return '소개페이지';
-        if (urlLower.includes('/product') || titleLower.includes('product'))
+        if (pathname.includes('/contact') || titleLower.includes('contact'))
+            return '연락처';
+        if (pathname.includes('/company') || titleLower.includes('company'))
+            return '회사정보';
+        if (pathname.includes('/team') || titleLower.includes('team'))
+            return '팀소개';
+        if (pathname.includes('/product') || titleLower.includes('product'))
             return '제품페이지';
-        if (urlLower.includes('/service') || titleLower.includes('service'))
+        if (pathname.includes('/service') || titleLower.includes('service'))
             return '서비스페이지';
-        if (urlLower.includes('/blog') || titleLower.includes('blog'))
+        if (pathname.includes('/solution') || titleLower.includes('solution'))
+            return '솔루션';
+        if (pathname.includes('/pricing') || titleLower.includes('pricing'))
+            return '가격정책';
+        if (pathname.includes('/plans') || titleLower.includes('plan'))
+            return '요금제';
+        if (pathname.includes('/features') || titleLower.includes('feature'))
+            return '기능소개';
+        if (pathname.includes('/blog') || titleLower.includes('blog'))
             return '블로그';
-        if (urlLower.includes('/news') || titleLower.includes('news'))
+        if (pathname.includes('/news') || titleLower.includes('news'))
             return '뉴스';
+        if (pathname.includes('/article') || titleLower.includes('article'))
+            return '기사';
+        if (pathname.includes('/resource') || titleLower.includes('resource'))
+            return '자료실';
+        if (pathname.includes('/documentation') || pathname.includes('/docs'))
+            return '문서';
+        if (pathname.includes('/support') || titleLower.includes('support'))
+            return '고객지원';
+        if (pathname.includes('/help') || titleLower.includes('help'))
+            return '도움말';
+        if (pathname.includes('/faq') || titleLower.includes('faq'))
+            return 'FAQ';
+        if (pathname.includes('/career') || pathname.includes('/jobs'))
+            return '채용정보';
+        if (pathname.includes('/privacy') || titleLower.includes('privacy'))
+            return '개인정보처리방침';
+        if (pathname.includes('/terms') || titleLower.includes('terms'))
+            return '이용약관';
+        if (pathname.includes('/legal') || titleLower.includes('legal'))
+            return '법적고지';
         return '일반페이지';
     }
     async getPageDetails(url) {
@@ -795,56 +1096,162 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
         const nodes = [];
         const edges = [];
         const processedUrls = new Set();
+        const pageColors = {
+            '홈페이지': '#ef4444',
+            '소개페이지': '#10b981',
+            '회사정보': '#10b981',
+            '팀소개': '#10b981',
+            '연락처': '#f59e0b',
+            '제품페이지': '#8b5cf6',
+            '서비스페이지': '#06b6d4',
+            '솔루션': '#06b6d4',
+            '가격정책': '#ec4899',
+            '요금제': '#ec4899',
+            '기능소개': '#8b5cf6',
+            '블로그': '#f97316',
+            '뉴스': '#f97316',
+            '자료실': '#f97316',
+            '문서': '#6366f1',
+            '고객지원': '#14b8a6',
+            '도움말': '#14b8a6',
+            'FAQ': '#14b8a6',
+            '로그인': '#64748b',
+            '회원가입': '#64748b',
+            '채용정보': '#84cc16',
+            '개인정보처리방침': '#94a3b8',
+            '이용약관': '#94a3b8',
+            '법적고지': '#94a3b8',
+            '일반페이지': '#6b7280'
+        };
+        const elementColors = {
+            'main-menu': '#3b82f6',
+            'sub-menu': '#60a5fa',
+            'footer-menu': '#93c5fd',
+            'button': '#a855f7',
+            'submit': '#7c3aed',
+            'link-button': '#c084fc',
+            'form': '#fbbf24'
+        };
+        const resultsByDepth = {};
+        results.forEach(result => {
+            const depthMatch = result.id.match(/depth(\d+)/);
+            const depth = depthMatch ? parseInt(depthMatch[1]) : 0;
+            if (!resultsByDepth[depth])
+                resultsByDepth[depth] = [];
+            resultsByDepth[depth].push(result);
+        });
         results.forEach((result) => {
             if (!processedUrls.has(result.url)) {
                 processedUrls.add(result.url);
-                let color = '#6366f1';
-                switch (result.pageType) {
-                    case '홈페이지':
-                        color = '#ef4444';
-                        break;
-                    case '소개페이지':
-                        color = '#10b981';
-                        break;
-                    case '연락처':
-                        color = '#f59e0b';
-                        break;
-                    case '제품페이지':
-                        color = '#8b5cf6';
-                        break;
-                    case '서비스페이지':
-                        color = '#06b6d4';
-                        break;
-                }
+                const depthMatch = result.id.match(/depth(\d+)/);
+                const depth = depthMatch ? parseInt(depthMatch[1]) : 0;
+                const pageColor = pageColors[result.pageType] || pageColors['일반페이지'];
                 nodes.push({
                     id: result.id,
-                    label: result.title.substring(0, 30) + (result.title.length > 30 ? '...' : ''),
-                    color,
+                    label: result.title.substring(0, 40) + (result.title.length > 40 ? '...' : ''),
+                    color: pageColor,
                     type: result.pageType,
                     url: result.url,
                     title: result.title,
                     screenshot: result.screenshotPath,
-                    nodeType: 'page'
+                    nodeType: 'page',
+                    depth
                 });
-                if (result.buttons && result.buttons.length > 0) {
-                    result.buttons.forEach((button, index) => {
-                        const buttonText = button.text;
-                        const buttonType = button.type;
+                if (result.elements?.menus && result.elements.menus.length > 0) {
+                    result.elements.menus.forEach((menu, index) => {
+                        const menuId = `${result.id}_menu_${index}`;
+                        const menuColor = menu.type === 'main' ? elementColors['main-menu'] :
+                            menu.type === 'footer' ? elementColors['footer-menu'] :
+                                elementColors['sub-menu'];
                         nodes.push({
-                            id: `${result.id}_button_${index}`,
-                            label: buttonText,
-                            color: '#6366f1',
-                            type: buttonType,
-                            url: result.url,
-                            title: `${buttonText} (${result.title})`,
-                            screenshot: result.screenshotPath,
-                            nodeType: 'button',
-                            buttonType,
-                            parentPageId: result.id
+                            id: menuId,
+                            label: menu.text,
+                            color: menuColor,
+                            type: `${menu.type}-menu`,
+                            url: menu.href,
+                            title: `${menu.text} (${result.title})`,
+                            screenshot: '',
+                            nodeType: 'menu',
+                            elementType: `${menu.type}-menu`,
+                            parentPageId: result.id,
+                            depth
                         });
                         edges.push({
                             from: result.id,
-                            to: `${result.id}_button_${index}`
+                            to: menuId
+                        });
+                        const targetPage = results.find(r => r.url === menu.href);
+                        if (targetPage) {
+                            edges.push({
+                                from: menuId,
+                                to: targetPage.id
+                            });
+                        }
+                    });
+                }
+                if (result.elements?.buttons && result.elements.buttons.length > 0) {
+                    const importantButtons = result.elements.buttons.filter(btn => {
+                        const text = btn.text.toLowerCase();
+                        return !text.includes('cookie') &&
+                            !text.includes('accept') &&
+                            !text.includes('decline') &&
+                            !text.includes('×') &&
+                            !text.includes('x') &&
+                            text.length > 2 &&
+                            text.length < 30;
+                    }).slice(0, 5);
+                    importantButtons.forEach((button, index) => {
+                        const buttonId = `${result.id}_button_${index}`;
+                        const buttonColor = button.type === 'submit' ? elementColors['submit'] :
+                            button.type === 'link-button' ? elementColors['link-button'] :
+                                elementColors['button'];
+                        nodes.push({
+                            id: buttonId,
+                            label: button.text,
+                            color: buttonColor,
+                            type: button.type,
+                            url: button.href || result.url,
+                            title: `${button.text} (${result.title})`,
+                            screenshot: '',
+                            nodeType: 'button',
+                            elementType: button.type,
+                            parentPageId: result.id,
+                            depth
+                        });
+                        edges.push({
+                            from: result.id,
+                            to: buttonId
+                        });
+                        if (button.href) {
+                            const targetPage = results.find(r => r.url === button.href);
+                            if (targetPage) {
+                                edges.push({
+                                    from: buttonId,
+                                    to: targetPage.id
+                                });
+                            }
+                        }
+                    });
+                }
+                if (result.elements?.forms && result.elements.forms.length > 0) {
+                    result.elements.forms.forEach((form, index) => {
+                        const formId = `${result.id}_form_${index}`;
+                        nodes.push({
+                            id: formId,
+                            label: `${form.name} (${form.fields} fields)`,
+                            color: elementColors['form'],
+                            type: 'form',
+                            url: result.url,
+                            title: `${form.name} Form (${result.title})`,
+                            screenshot: '',
+                            nodeType: 'form',
+                            elementType: 'form',
+                            parentPageId: result.id,
+                            depth
+                        });
+                        edges.push({
+                            from: result.id,
+                            to: formId
                         });
                     });
                 }
@@ -853,7 +1260,7 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
         results.forEach(result => {
             result.links.forEach(link => {
                 const targetResult = results.find(r => r.url === link);
-                if (targetResult) {
+                if (targetResult && !edges.some(e => e.from === result.id && e.to === targetResult.id)) {
                     edges.push({
                         from: result.id,
                         to: targetResult.id

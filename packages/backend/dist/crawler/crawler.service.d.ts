@@ -29,6 +29,24 @@ export interface CrawlResult {
         imageCount: number;
         linkCount: number;
     };
+    elements?: {
+        menus: {
+            text: string;
+            href: string;
+            type: 'main' | 'sub' | 'footer';
+        }[];
+        buttons: {
+            text: string;
+            type: string;
+            action?: string;
+            href?: string;
+        }[];
+        forms: {
+            name: string;
+            action: string;
+            fields: number;
+        }[];
+    };
 }
 export interface NetworkNode {
     id: string;
@@ -38,9 +56,10 @@ export interface NetworkNode {
     url: string;
     title: string;
     screenshot: string;
-    nodeType: 'page' | 'button';
-    buttonType?: string;
+    nodeType: 'page' | 'menu' | 'button' | 'form';
+    elementType?: string;
     parentPageId?: string;
+    depth?: number;
 }
 export interface NetworkEdge {
     from: string;
