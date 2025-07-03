@@ -416,21 +416,6 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
                                     catch { }
                                 }
                             });
-                            const currentPath = location.pathname;
-                            const commonRoutes = [
-                                '/about', '/about-us', '/company',
-                                '/products', '/services', '/solutions',
-                                '/contact', '/contact-us', '/support',
-                                '/blog', '/news', '/resources',
-                                '/pricing', '/plans', '/features',
-                                '/login', '/signup', '/register',
-                                '/careers', '/jobs', '/team',
-                                '/help', '/faq', '/documentation',
-                                '/privacy', '/terms', '/legal'
-                            ];
-                            commonRoutes.forEach(route => {
-                                urlSet.add(new URL(route, location.origin).toString());
-                            });
                             return Array.from(urlSet);
                         };
                         const links = collectLinks();
@@ -852,21 +837,6 @@ let CrawlerService = CrawlerService_1 = class CrawlerService {
                                     }
                                     catch { }
                                 }
-                            });
-                            const currentPath = location.pathname;
-                            const commonRoutes = [
-                                '/about', '/about-us', '/company',
-                                '/products', '/services', '/solutions',
-                                '/contact', '/contact-us', '/support',
-                                '/blog', '/news', '/resources',
-                                '/pricing', '/plans', '/features',
-                                '/login', '/signup', '/register',
-                                '/careers', '/jobs', '/team',
-                                '/help', '/faq', '/documentation',
-                                '/privacy', '/terms', '/legal'
-                            ];
-                            commonRoutes.forEach(route => {
-                                urlSet.add(new URL(route, location.origin).toString());
                             });
                             return Array.from(urlSet);
                         };

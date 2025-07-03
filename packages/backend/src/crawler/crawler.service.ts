@@ -618,24 +618,7 @@ export class CrawlerService {
                 }
               });
 
-              // 6) 일반적인 SPA 라우트 패턴 추측 (현재 URL 기반)
-              const currentPath = location.pathname;
-              const commonRoutes = [
-                '/about', '/about-us', '/company',
-                '/products', '/services', '/solutions',
-                '/contact', '/contact-us', '/support',
-                '/blog', '/news', '/resources',
-                '/pricing', '/plans', '/features',
-                '/login', '/signup', '/register',
-                '/careers', '/jobs', '/team',
-                '/help', '/faq', '/documentation',
-                '/privacy', '/terms', '/legal'
-              ];
-              
-              commonRoutes.forEach(route => {
-                urlSet.add(new URL(route, location.origin).toString());
-              });
-
+              // 실제 존재하는 링크만 반환 (추측 제거)
               return Array.from(urlSet);
             };
 
@@ -1142,24 +1125,7 @@ export class CrawlerService {
                 }
               });
 
-              // 6) 일반적인 SPA 라우트 패턴 추측 (현재 URL 기반)
-              const currentPath = location.pathname;
-              const commonRoutes = [
-                '/about', '/about-us', '/company',
-                '/products', '/services', '/solutions',
-                '/contact', '/contact-us', '/support',
-                '/blog', '/news', '/resources',
-                '/pricing', '/plans', '/features',
-                '/login', '/signup', '/register',
-                '/careers', '/jobs', '/team',
-                '/help', '/faq', '/documentation',
-                '/privacy', '/terms', '/legal'
-              ];
-              
-              commonRoutes.forEach(route => {
-                urlSet.add(new URL(route, location.origin).toString());
-              });
-
+              // 실제 존재하는 링크만 반환 (추측 제거)
               return Array.from(urlSet);
             };
 

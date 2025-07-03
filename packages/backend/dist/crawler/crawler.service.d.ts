@@ -101,19 +101,18 @@ export declare class CrawlerService {
     private generateVisualizationHtml;
     getUserAnalyses(userId: number, limit?: number): Promise<{
         id: string;
-        createdAt: Date;
-        updatedAt: Date;
         url: string;
         title: string | null;
         status: string;
         progress: number;
         pageCount: number;
+        createdAt: Date;
+        updatedAt: Date;
     }[]>;
     getAnalysis(analysisId: string, userId: number): Promise<{
         resultData: any;
         id: string;
-        createdAt: Date;
-        updatedAt: Date;
+        userId: number;
         url: string;
         title: string | null;
         status: string;
@@ -122,7 +121,8 @@ export declare class CrawlerService {
         screenshotPath: string | null;
         htmlPath: string | null;
         creditsUsed: number;
-        userId: number;
+        createdAt: Date;
+        updatedAt: Date;
     }>;
     downloadFile(analysisId: string, userId: number, fileType: 'png' | 'html', pageId: string): Promise<{
         filePath: string;
